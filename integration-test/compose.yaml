@@ -1,0 +1,39 @@
+# integration-test/compose.yaml
+
+networks:
+  test_net:
+    driver: bridge
+
+services:
+  service-a:
+    build:
+      context: .
+      dockerfile: test-node.dockerfile
+      args:
+        NETINIT_IMAGE: net-init-builder-img
+    container_name: service-a
+    # ports: section removed
+    environment:
+      # --- Net-Init Configuration ---
+      - NETINIT_WAIT=tcp://service-b:80
+      - NETINIT_HEALTHCHECK_PORT=9090 # Internal port net-init listens on
+      - NETINIT_RETRY_INTERVAL=1
+      - NETINIT_LOG_LEVEL=debug
+      - NETINIT_TIMEOUT=90
+      # --- Application Configuration ---
+      - TEST_VAR=hello_netinit_compose
+    networks:
+      - test_net
+
+  service-b:
+    image: nginx:1.25-alpine
+    container_name: service-b
+    # ports: section removed
+    healthcheck:
+      # Healthcheck uses internal port 80
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80"]
+      interval: 2s
+      timeout: 1s
+      retries: 5
+    networks:
+      - test_net
