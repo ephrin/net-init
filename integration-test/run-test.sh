@@ -32,6 +32,8 @@ cleanup() {
   if [ "$CLEANUP_ENABLED" = true ]; then
     echo "--- Cleaning up Docker Compose environment ---"
     docker compose down -v --remove-orphans --timeout 30 || true
+    # Cleanup any leftover containers with our names (just in case)
+    docker rm -f service-a service-b >/dev/null 2>&1 || true
     echo "--- Cleanup complete ---"
   else
     echo "--- Skipping cleanup ---"
@@ -47,11 +49,28 @@ echo "--- Building test application images ---"
 DOCKER_BUILDKIT=1 docker compose build --build-arg NETINIT_IMAGE=${NETINIT_BUILDER_IMG}
 
 # --- Test Execution ---
-echo "--- Starting service-a (will wait for service-b) ---"
-docker compose up -d service-a
+# We need to test that service-a properly waits for service-b,
+# simulating real-world network conditions where a service might not be available
+
+# First, clean up any existing environment
+echo "--- Cleaning existing environment ---"
+docker compose down -v --remove-orphans --timeout 30 || true
+docker rm -f service-a service-b >/dev/null 2>&1 || true
+docker network rm integration-test_test_net >/dev/null 2>&1 || true
+
+# Start service-a only - service-b doesn't exist yet
+# This simulates a dependency not being deployed/ready
+echo "--- Starting service-a (with service-b dependency missing) ---"
+# Use explicit restart to make sure we start fresh
+docker compose up -d --force-recreate service-a
 
 echo "--- Waiting a few seconds for service-a container to start ---"
 sleep 5
+
+# Debug: Inspect service-a DNS resolution
+echo "--- Debugging: Check DNS resolution for service-b from service-a ---"
+docker compose exec service-a getent hosts service-b || echo "DNS resolution failed as expected"
+docker compose exec service-a ping -c 1 -W 1 service-b || echo "Ping failed as expected"
 
 echo "--- Checking service-a health via exec (expecting 503 - waiting) ---"
 MAX_RETRIES=10
@@ -74,28 +93,29 @@ until [ "$HTTP_STATUS" -eq 503 ]; do
 done
 echo "--- service-a health check via exec returned 503 as expected ---"
 
+# Now start service-b, simulating dependency coming online
 echo "--- Starting service-b dependency ---"
 docker compose up -d service-b
 
-echo "--- Checking if nginx is listening inside service-b container (retrying max 20s) ---"
+echo "--- Confirming service-b is running and accessible ---"
+# Wait for service-b to be healthy
 MAX_INTERNAL_RETRIES=10
 INTERNAL_RETRY_COUNT=0
 INTERNAL_CHECK_OK=false
 until [ "$INTERNAL_CHECK_OK" = true ]; do
     INTERNAL_RETRY_COUNT=$((INTERNAL_RETRY_COUNT + 1))
     if [ ${INTERNAL_RETRY_COUNT} -gt ${MAX_INTERNAL_RETRIES} ]; then
-        echo "--- FAILURE: Nginx did NOT respond internally on port 80 (${SERVICE_B_INTERNAL_URL}) after ${MAX_INTERNAL_RETRIES} retries ---"
+        echo "--- FAILURE: Service-b container is not healthy after ${MAX_INTERNAL_RETRIES} retries ---"
         print_logs_on_failure
         exit 1
     fi
-    echo "Retry #${INTERNAL_RETRY_COUNT} checking internal wget..."
-    # Use wget inside the container via exec
-    if docker compose exec service-b wget --quiet --tries=1 --spider ${SERVICE_B_INTERNAL_URL}; then
-        echo "--- Nginx IS responding internally on port 80 ---"
+    echo "Retry #${INTERNAL_RETRY_COUNT} checking service-b container health..."
+    if docker compose exec service-b wget --quiet --tries=1 --spider ${SERVICE_B_INTERNAL_URL} 2>/dev/null; then
+        echo "--- Service-b is now running and responding ---"
         INTERNAL_CHECK_OK=true
     else
-        echo "Internal check failed (exit code $?), retrying..."
-        sleep 2 # Wait before retrying internal check
+        echo "Service-b health check failed, retrying..."
+        sleep 2
     fi
 done
 

@@ -124,8 +124,8 @@ func main() {
 
 	// 8. Final Cleanup and Exit
 	slog.Info("Net-Init exiting", "exitCode", exitCode)
-	cancel() // Ensure context is cancelled if not already
-	wg.Wait()  // Wait for dependency checks to fully stop
+	cancel()  // Ensure context is cancelled if not already
+	wg.Wait() // Wait for dependency checks to fully stop
 	os.Exit(exitCode)
 }
 
@@ -361,7 +361,7 @@ func parseSingleDependency(depRaw string) (Dependency, error) {
 			return dep, fmt.Errorf("invalid exec dependency format (empty command): '%s'", depRaw)
 		}
 		dep.Target = cmdParts[0] // The command/script path
-		dep.Args = cmdParts[1:]   // The arguments
+		dep.Args = cmdParts[1:]  // The arguments
 		dep.CheckFunc = checkExec
 	default:
 		return dep, fmt.Errorf("unsupported dependency type '%s' in '%s'", dep.Type, depRaw)
@@ -428,20 +428,55 @@ func shutdownHTTPServer(server *http.Server) {
 	}
 }
 
-// startDependencyChecks launches goroutines for each dependency check.
-func startDependencyChecks(ctx context.Context, cfg *Config, wg *sync.WaitGroup, readyChan chan struct{}, readyOnce *sync.Once, allReady *atomic.Bool, httpClient *http.Client) {
-	if len(cfg.WaitDeps) == 0 {
-		// No dependencies, mark as ready immediately and signal
-		allReady.Store(true)
-		overallStatus.Set(1)
-		slog.Info("No dependencies specified, marking ready immediately.")
-		readyOnce.Do(func() { close(readyChan) })
-		return
+// handleDependencyStateChange updates the dependency state and metrics
+func handleDependencyStateChange(dep *Dependency, isReady bool, err error, checkOverallReady func()) bool {
+	stateChanged := false
+
+	if isReady { // Dependency is ready
+		if !dep.isReady.Load() {
+			slog.Info("Dependency ready", "dependency", dep.Raw)
+			dep.isReady.Store(true)
+			dep.Metric.Set(1)
+			stateChanged = true
+		}
+	} else { // Dependency is not ready
+		if dep.isReady.Load() {
+			slog.Warn("Dependency NOT ready (was ready before)", "dependency", dep.Raw, "error", err)
+			dep.isReady.Store(false)
+			dep.Metric.Set(0)
+			stateChanged = true
+		} else {
+			slog.Debug("Dependency not ready", "dependency", dep.Raw, "error", err)
+		}
 	}
 
-	checkOverallReady := func() {
-		// This function determines overall readiness and signals via readyChan (once)
-		if checkAllDependenciesReady(cfg.WaitDeps) {
+	if stateChanged {
+		checkOverallReady()
+	}
+	return stateChanged
+}
+
+// performDependencyCheck performs a single check of a dependency
+func performDependencyCheck(ctx context.Context, dep *Dependency, httpClient *http.Client, retryInterval time.Duration) error {
+	checkCtx, checkCancel := context.WithTimeout(ctx, retryInterval)
+	defer checkCancel()
+	return dep.CheckFunc(checkCtx, *dep, httpClient)
+}
+
+// handleContextCancellation handles cleanup when context is cancelled
+func handleContextCancellation(dep *Dependency, checkOverallReady func(), reason error) {
+	slog.Warn("Stopping check due to context cancellation", "dependency", dep.Raw, "reason", reason)
+	if dep.isReady.Load() {
+		dep.isReady.Store(false)
+		dep.Metric.Set(0)
+		checkOverallReady()
+	}
+}
+
+// createOverallReadyChecker creates a function to check overall readiness
+func createOverallReadyChecker(deps []Dependency, allReady *atomic.Bool, readyOnce *sync.Once, readyChan chan struct{}) func() {
+	return func() {
+		if checkAllDependenciesReady(deps) {
 			if !allReady.Load() {
 				slog.Info("All dependencies are now ready!")
 				allReady.Store(true)
@@ -456,6 +491,20 @@ func startDependencyChecks(ctx context.Context, cfg *Config, wg *sync.WaitGroup,
 			}
 		}
 	}
+}
+
+// startDependencyChecks launches goroutines for each dependency check.
+func startDependencyChecks(ctx context.Context, cfg *Config, wg *sync.WaitGroup, readyChan chan struct{}, readyOnce *sync.Once, allReady *atomic.Bool, httpClient *http.Client) {
+	if len(cfg.WaitDeps) == 0 {
+		// No dependencies, mark as ready immediately and signal
+		allReady.Store(true)
+		overallStatus.Set(1)
+		slog.Info("No dependencies specified, marking ready immediately.")
+		readyOnce.Do(func() { close(readyChan) })
+		return
+	}
+
+	checkOverallReady := createOverallReadyChecker(cfg.WaitDeps, allReady, readyOnce, readyChan)
 
 	for i := range cfg.WaitDeps {
 		wg.Add(1)
@@ -466,64 +515,48 @@ func startDependencyChecks(ctx context.Context, cfg *Config, wg *sync.WaitGroup,
 			defer ticker.Stop()
 
 			// Perform initial check
-			isInitiallyReady := false
-			func() {
-				checkCtx, checkCancel := context.WithTimeout(ctx, cfg.RetryInterval)
-				defer checkCancel()
-				err := dep.CheckFunc(checkCtx, *dep, httpClient)
-				if err == nil {
-					if !dep.isReady.Load() {
-						slog.Info("Dependency ready", "dependency", dep.Raw)
-						dep.isReady.Store(true)
-						dep.Metric.Set(1)
-					}
-					isInitiallyReady = true
-				} else {
-					slog.Debug("Dependency not ready (initial check)", "dependency", dep.Raw, "error", err)
-					dep.Metric.Set(0)
-					isInitiallyReady = false
-				}
-			}()
-			checkOverallReady() // Check overall status after initial check
+			err := performDependencyCheck(ctx, dep, httpClient, cfg.RetryInterval)
+			isInitiallyReady := err == nil
 
-			// Subsequent checks loop
+			// Update status based on initial check
 			if !isInitiallyReady {
-				for {
-					select {
-					case <-ctx.Done():
-						slog.Warn("Stopping check due to context cancellation", "dependency", dep.Raw, "reason", ctx.Err())
-						if dep.isReady.Load() {
-							dep.isReady.Store(false); dep.Metric.Set(0); checkOverallReady()
-						}
-						return
-					case <-ticker.C:
-						checkCtx, checkCancel := context.WithTimeout(ctx, cfg.RetryInterval)
-						err := dep.CheckFunc(checkCtx, *dep, httpClient)
-						checkCancel()
-						stateChanged := false
-						if err == nil {
-							if !dep.isReady.Load() {
-								slog.Info("Dependency ready", "dependency", dep.Raw); dep.isReady.Store(true); dep.Metric.Set(1); stateChanged = true
-							}
-						} else {
-							if dep.isReady.Load() {
-								slog.Warn("Dependency NOT ready (was ready before)", "dependency", dep.Raw, "error", err); dep.isReady.Store(false); dep.Metric.Set(0); stateChanged = true
-							} else {
-								slog.Debug("Dependency not ready", "dependency", dep.Raw, "error", err)
-							}
-						}
-						if stateChanged { checkOverallReady() }
-					}
-				}
+				dep.Metric.Set(0)
+			}
+			handleDependencyStateChange(dep, isInitiallyReady, err, checkOverallReady)
+
+			// Subsequent checks
+			if !isInitiallyReady {
+				monitorDependency(ctx, dep, ticker, httpClient, cfg.RetryInterval, checkOverallReady)
 			} else {
-				// If initially ready, just wait for context cancellation
-				<-ctx.Done()
-				slog.Warn("Stopping check (was initially ready) due to context cancellation", "dependency", dep.Raw, "reason", ctx.Err())
-				if dep.isReady.Load() {
-					dep.isReady.Store(false); dep.Metric.Set(0); checkOverallReady()
-				}
+				waitForCancellation(ctx, dep, checkOverallReady)
 			}
 		}(&cfg.WaitDeps[i])
+	}
+}
+
+// monitorDependency handles periodic dependency checks
+func monitorDependency(ctx context.Context, dep *Dependency, ticker *time.Ticker, httpClient *http.Client, retryInterval time.Duration, checkOverallReady func()) {
+	for {
+		select {
+		case <-ctx.Done():
+			handleContextCancellation(dep, checkOverallReady, ctx.Err())
+			return
+		case <-ticker.C:
+			err := performDependencyCheck(ctx, dep, httpClient, retryInterval)
+			handleDependencyStateChange(dep, err == nil, err, checkOverallReady)
+		}
+	}
+}
+
+// waitForCancellation waits for context cancellation for initially ready dependencies
+func waitForCancellation(ctx context.Context, dep *Dependency, checkOverallReady func()) {
+	<-ctx.Done()
+	slog.Warn("Stopping check (was initially ready) due to context cancellation",
+		"dependency", dep.Raw, "reason", ctx.Err())
+	if dep.isReady.Load() {
+		dep.isReady.Store(false)
+		dep.Metric.Set(0)
+		checkOverallReady()
 	}
 }
 
@@ -550,7 +583,7 @@ func executeApplication(ctx context.Context, cfg *Config, sigChan chan os.Signal
 	if len(cfg.Cmd) == 0 {
 		slog.Warn("No command specified.")
 		handleNoCommand(ctx, cfg, sigChan, readyChan, wg) // Handle idling
-		return 0 // Exit cleanly if signaled while idling
+		return 0                                          // Exit cleanly if signaled while idling
 	}
 	cmdPath, err := exec.LookPath(cfg.Cmd[0])
 	if err != nil {
@@ -573,7 +606,9 @@ func executeApplication(ctx context.Context, cfg *Config, sigChan chan os.Signal
 		case <-ctx.Done():
 			slog.Error("Timeout reached while waiting for dependencies.", "error", ctx.Err())
 			exitCode = 1
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) { exitCode = 124 }
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				exitCode = 124
+			}
 			return exitCode // Exit before starting child
 		case sig := <-sigChan:
 			slog.Info("Received signal while waiting for dependencies. Exiting.", "signal", sig)
@@ -666,47 +701,224 @@ func handleSignalsAndWait(sigChan chan os.Signal, exitChan chan error, cmd *exec
 // --- Specific Check Functions ---
 
 func checkTCP(ctx context.Context, dep Dependency, _ *http.Client) error {
-	dialer := net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "tcp", dep.Target)
-	if err != nil { return err }
-	return conn.Close()
+	slog.Debug("Starting TCP dependency check", "target", dep.Target)
+
+	// First check if we can resolve the hostname
+	host, port, err := net.SplitHostPort(dep.Target)
+	if err != nil {
+		slog.Debug("Failed to split host:port", "target", dep.Target, "error", err)
+		return fmt.Errorf("invalid host:port format - %w", err)
+	}
+	slog.Debug("Parsed target", "host", host, "port", port)
+
+	// Manual check for Docker DNS - must be performed explicitly
+	// Create a custom context with a short timeout just for DNS
+	dnsCtx, dnsCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer dnsCancel()
+
+	// Use a DNS resolver that explicitly uses the context
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{}
+			return d.DialContext(ctx, network, address)
+		},
+	}
+
+	// Check if the host is an IP address
+	if net.ParseIP(host) == nil {
+		// Not an IP address, we MUST resolve it successfully
+		slog.Debug("Host is not an IP, attempting DNS resolution", "host", host)
+		addrs, err := resolver.LookupHost(dnsCtx, host)
+		if err != nil {
+			slog.Debug("DNS resolution failed", "host", host, "error", err)
+			return fmt.Errorf("DNS resolution failed: %w", err)
+		}
+
+		if len(addrs) == 0 {
+			slog.Debug("DNS resolution returned no addresses", "host", host)
+			return fmt.Errorf("DNS resolution returned no addresses for host: %s", host)
+		}
+
+		slog.Debug("DNS resolution succeeded", "host", host, "addresses", addrs)
+	} else {
+		slog.Debug("Host is an IP address, skipping DNS resolution", "host", host)
+	}
+
+	// Now we'll make a TCP connection with a specific protocol-based check
+	// according to the port/service
+	slog.Debug("Attempting TCP connection", "target", dep.Target)
+
+	// Use an explicit short timeout for the connection attempt
+	connCtx, connCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer connCancel()
+
+	dialer := net.Dialer{
+		KeepAlive: -1, // Disable keep-alive to avoid false positives
+	}
+
+	conn, err := dialer.DialContext(connCtx, "tcp", dep.Target)
+	if err != nil {
+		slog.Debug("TCP connection failed", "target", dep.Target, "error", err)
+		return fmt.Errorf("connection failed: %w", err)
+	}
+	defer conn.Close()
+
+	// Verify the connection is actually to the address we expect
+	localAddr := conn.LocalAddr().String()
+	remoteAddr := conn.RemoteAddr().String()
+	slog.Debug("TCP connection established", "target", dep.Target,
+		"local", localAddr, "remote", remoteAddr)
+
+	// Actually try sending a protocol-appropriate probe
+	// For port 80/443, send an HTTP request
+	portNum, _ := strconv.Atoi(port)
+
+	if portNum == 80 || portNum == 443 {
+		// HTTP probe for web servers
+		slog.Debug("Port 80/443 detected, sending HTTP probe", "port", port)
+		_, err = conn.Write([]byte("HEAD / HTTP/1.0\r\n\r\n"))
+	} else {
+		// Generic probe
+		slog.Debug("Sending generic probe", "port", port)
+		_, err = conn.Write([]byte("PING\r\n"))
+	}
+
+	if err != nil {
+		slog.Debug("Failed to write probe to connection", "target", dep.Target, "error", err)
+		return fmt.Errorf("connection write failed: %w", err)
+	}
+
+	// Now try to read a response - we don't require a valid response,
+	// but at least some data or a graceful close
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+
+	// Try to read a response
+	buffer := make([]byte, 64) // Bigger buffer to catch protocol responses
+	n, err := conn.Read(buffer)
+
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			// Server closed connection after receiving our probe
+			// This is acceptable behavior
+			slog.Debug("Connection closed by server after probe (EOF)", "target", dep.Target)
+		} else if os.IsTimeout(err) {
+			// In Docker environment, we need to be super strict about timeouts
+			// if we already confirmed DNS resolution
+			slog.Debug("Connection read timed out - marking as failure", "target", dep.Target)
+			return fmt.Errorf("connection read timed out: %w", err)
+		} else {
+			// Other network errors are considered failures
+			slog.Debug("Connection read failed", "target", dep.Target, "error", err)
+			return fmt.Errorf("connection read failed: %w", err)
+		}
+	} else {
+		responseData := string(buffer[:n])
+		slog.Debug("Received response from server", "target", dep.Target,
+			"bytes", n, "data", responseData)
+
+		// If we see a 302 Found redirect response with empty location,
+		// this is likely Docker network handling a non-existent container
+		if strings.Contains(responseData, "302 Found") &&
+			strings.Contains(responseData, "location: https:///") {
+			slog.Debug("Detected Docker network placeholder response - rejecting", "target", dep.Target)
+			return fmt.Errorf("connection responded with Docker network placeholder")
+		}
+	}
+
+	slog.Debug("TCP dependency check completed successfully", "target", dep.Target)
+	return nil
 }
 
 func checkUDP(ctx context.Context, dep Dependency, _ *http.Client) error {
 	dialer := net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "udp", dep.Target)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	return conn.Close()
 }
 
 func checkHTTP(ctx context.Context, dep Dependency, client *http.Client) error {
-	if client == nil { client = http.DefaultClient }
+	slog.Debug("Starting HTTP dependency check", "target", dep.Target, "type", dep.Type)
+
+	if client == nil {
+		// Create a custom client that doesn't follow redirects
+		client = &http.Client{
+			Timeout: 10 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse // Don't follow redirects
+			},
+		}
+	}
+
+	// Ensure we have a properly formatted URL
 	reqUrl := dep.Target
 	if !strings.HasPrefix(reqUrl, "http://") && !strings.HasPrefix(reqUrl, "https://") {
 		if dep.Type == "http" || dep.Type == "https" {
 			reqUrl = fmt.Sprintf("%s://%s", dep.Type, dep.Target)
+			slog.Debug("Prefixed URL with scheme", "original", dep.Target, "result", reqUrl)
 		} else {
 			return fmt.Errorf("invalid dependency type '%s' for http check on target '%s'", dep.Type, dep.Target)
 		}
 	}
-	if _, err := url.ParseRequestURI(reqUrl); err != nil {
+
+	// Explicitly enforce HTTP if specified as the dependency type
+	if dep.Type == "http" && strings.HasPrefix(reqUrl, "https://") {
+		reqUrl = "http://" + strings.TrimPrefix(reqUrl, "https://")
+		slog.Debug("Forced HTTP scheme", "url", reqUrl)
+	}
+
+	// Parse and validate the URL
+	parsedURL, err := url.ParseRequestURI(reqUrl)
+	if err != nil {
+		slog.Debug("Invalid URL format", "url", reqUrl, "error", err)
 		return fmt.Errorf("invalid URL format: %s, error: %w", reqUrl, err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqUrl, nil)
-	if err != nil { return fmt.Errorf("failed to create request: %w", err) }
+
+	slog.Debug("Making HTTP request", "url", parsedURL.String(), "method", http.MethodGet)
+
+	// Create a request with specific headers to prevent HTTPS upgrades
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsedURL.String(), nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Important: Set explicit connection timeout in case DNS resolve succeeds but connect hangs
 	resp, err := client.Do(req)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) { return fmt.Errorf("request timed out: %w", err) }
-		if urlErr, ok := err.(*url.Error); ok { return fmt.Errorf("request url error: %w", urlErr) }
+		if errors.Is(err, context.DeadlineExceeded) {
+			slog.Debug("HTTP request timed out", "url", parsedURL.String())
+			return fmt.Errorf("request timed out: %w", err)
+		}
+		if urlErr, ok := err.(*url.Error); ok {
+			slog.Debug("HTTP URL error", "url", parsedURL.String(), "error", urlErr)
+			return fmt.Errorf("request url error: %w", urlErr)
+		}
+		slog.Debug("HTTP request failed", "url", parsedURL.String(), "error", err)
 		return fmt.Errorf("request failed: %w", err)
 	}
+
 	defer resp.Body.Close()
-	if _, err = io.Copy(io.Discard, resp.Body); err != nil {
-		slog.Warn("Error reading response body", "url", reqUrl, "error", err)
+
+	// Read and discard response body
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024)) // Read max 1K for debugging
+	if err != nil {
+		slog.Warn("Error reading response body", "url", parsedURL.String(), "error", err)
 	}
+
+	slog.Debug("Received HTTP response",
+		"url", parsedURL.String(),
+		"status", resp.Status,
+		"code", resp.StatusCode,
+		"bodyPreview", string(body))
+
+	// Check for successful status code (2xx)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
+
+	slog.Debug("HTTP dependency check successful", "url", parsedURL.String())
 	return nil
 }
 

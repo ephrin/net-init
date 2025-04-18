@@ -10,6 +10,8 @@ By default, `net-init` acts as a **guard**, preventing your application from sta
 * **Dependency Checking:**
   * Validates network dependencies before starting the main application (default behavior).
   * Supports **TCP**, **UDP**, **HTTP**, **HTTPS** endpoints.
+  * **Robust DNS resolution** with detection of Docker network placeholder responses.
+  * Protocol-appropriate probing based on port number (e.g., HTTP for ports 80/443).
   * Supports custom readiness checks via **external scripts/commands** (`exec://`).
   * Handles multiple dependencies concurrently.
   * Configurable retry intervals and overall timeout for checks.
@@ -35,7 +37,7 @@ By default, `net-init` acts as a **guard**, preventing your application from sta
 
 ## Installation
 
-(Installation instructions remain the same - build binary via Go or Docker, copy into app image)
+There are several ways to install and use `net-init` in your container images:
 
 **1. Build the `net-init` Binary:**
 
@@ -74,14 +76,18 @@ By default, `net-init` acts as a **guard**, preventing your application from sta
 **Dependency String Format (`NETINIT_WAIT`):**
 
 * **TCP:** `tcp://host:port` or simply `host:port` (e.g., `tcp://redis:6379`, `postgres-db:5432`)
+  * Validates both DNS resolution and connection establishment
+  * Detects and rejects Docker network placeholder responses
+  * Uses protocol-specific probes based on port (HTTP for 80/443)
 * **UDP:** `udp://host:port` (e.g., `udp://statsd:8125`) - *Note: Basic check.*
 * **HTTP:** `http://host[:port][/path]` (e.g., `http://user-api/health`) - Checks for `2xx`.
+  * Prevents HTTPS redirects from causing false positives
 * **HTTPS:** `https://host[:port][/path]` (e.g., `https://secure-api/status`) - Checks for `2xx`.
 * **Exec:** `exec://[/path/to/script] [arg1]...` (e.g., `exec://./check_db.sh`) - Checks for exit code `0`.
 
 ## Usage Pattern (Dockerfile Integration)
 
-(Pattern remains the same: `COPY`, `ENV`, `ENTRYPOINT`, `CMD`)
+Here are complete examples showing how to integrate `net-init` in your Dockerfiles:
 
 ### Example: Node.js Application (Waits for Deps - Default)
 
@@ -117,21 +123,43 @@ By default, `net-init` acts as a **guard**, preventing your application from sta
         ENTRYPOINT ["/usr/local/bin/net-init"]
         CMD [ "php", "your_script.php" ]
 
+## Advanced Network Checking Features
+
+`net-init` implements several advanced techniques to ensure robust dependency checking, especially in containerized environments:
+
+### Docker Network Detection
+
+When running in Docker environments, network requests to non-existent services can sometimes receive misleading "placeholder" responses instead of connection failures. `net-init` specifically detects and rejects these Docker network responses to prevent false positives.
+
+### Multi-Phase Connection Validation
+
+For TCP dependencies, `net-init` performs multi-phase validation:
+1. **DNS Resolution**: First explicitly checks if the hostname can be resolved, preventing false positives from Docker DNS handling.
+2. **Connection Establishment**: Verifies that a real TCP connection can be established.
+3. **Protocol-Specific Probing**: Sends appropriate probes based on the port (e.g., HTTP HEAD for ports 80/443).
+4. **Response Validation**: Carefully examines responses to detect service placeholders and misleading responses.
+
+### HTTP Redirect Handling
+
+For HTTP dependencies, `net-init` prevents false positives from HTTP-to-HTTPS redirects by using a client that doesn't follow redirects automatically.
+
 ## Prometheus Metrics
 
-(Section remains the same)
+The following Prometheus metrics are exposed on the metrics endpoint (default: `/metrics`):
 
 * `netinit_dependency_up{dependency="<dependency_string>"}`: (Gauge) `1` if up, `0` if down.
 * `netinit_overall_status`: (Gauge) `1` if all dependencies ready, `0` otherwise.
 
 ## Development
 
-(Section remains the same)
-
-* **Prerequisites:** Go 1.21 or later.
-* **Building:** `go build -o net-init main.go`
-* **Testing:** `go test -v ./...`
-* **Dependencies:** Uses Go modules. Run `go mod tidy`.
+* **Prerequisites:** Go 1.22 or later
+* **Building:** `go build -o net-init main.go` or with optimized flags: `CGO_ENABLED=0 go build -ldflags="-w -s" -o net-init main.go`
+* **Testing:** 
+  * Run all tests: `go test -v ./...`
+  * Run a specific test: `go test -v -run=TestName`
+* **Multi-platform Builds:** Use the included build script: `./build.sh -t your-image:tag`
+* **Integration Testing:** `cd integration-test && ./run-test.sh`
+* **Dependencies:** Uses Go modules. Run `go mod tidy`
 
 ## Contributing
 
@@ -139,4 +167,4 @@ Contributions are welcome! Please feel free to open an issue or submit a pull re
 
 ## License
 
-nice one
+MIT License - See LICENSE file for details.
