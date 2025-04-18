@@ -30,13 +30,13 @@ type Config struct {
 	HealthCheckPort  int
 	HealthCheckPath  string
 	MetricsPath      string
-	Timeout          time.Duration // Timeout for deps ready (default) or overall (immediate start)
+	Timeout          time.Duration
 	RetryInterval    time.Duration
 	LogLevel         slog.Level
-	Cmd              []string // Command to execute as child process
+	Cmd              []string
 	TlsSkipVerify    bool
 	TlsCACertPath    string
-	StartImmediately bool // New flag: Start app immediately or wait for deps?
+	StartImmediately bool
 }
 
 type Dependency struct {
@@ -59,7 +59,7 @@ const (
 	defaultLogLevel        = slog.LevelInfo
 )
 
-var defaultCustomCheckTimeout = 10 * time.Second
+var defaultCustomCheckTimeout = 10 * time.Second // Keep as var for tests
 
 // --- Prometheus Metrics ---
 var (
@@ -84,23 +84,13 @@ func init() {
 	overallStatus.Set(0) // Start as not ready
 }
 
-// --- Main Logic ---
+// --- Main Orchestration ---
 
 func main() {
-	// --- Initial Setup (Logging, Config Parsing) ---
-	logLevel := defaultLogLevel
-	if levelStr := os.Getenv("NETINIT_LOG_LEVEL"); levelStr != "" {
-		var err error
-		logLevel, err = parseLogLevel(levelStr)
-		if err != nil {
-			slog.Error("Invalid NETINIT_LOG_LEVEL, using default", "value", levelStr, "error", err)
-			logLevel = defaultLogLevel
-		}
-	}
-	jsonHandler := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})
-	logger := slog.New(jsonHandler)
-	slog.SetDefault(logger)
+	// 1. Setup Logging
+	setupLogging()
 
+	// 2. Parse Configuration
 	cfg, err := parseConfig(os.Args[1:])
 	if err != nil {
 		slog.Error("Configuration error", "error", err)
@@ -108,29 +98,296 @@ func main() {
 	}
 	slog.Info("Net-Init starting", "config", fmt.Sprintf("Cmd=%v WaitDeps=%d StartImmediately=%t HealthPort=%d Timeout=%v Retry=%v LogLevel=%v", cfg.Cmd, len(cfg.WaitDeps), cfg.StartImmediately, cfg.HealthCheckPort, cfg.Timeout, cfg.RetryInterval, cfg.LogLevel))
 
-	// --- Context and Signal Handling ---
+	// 3. Setup Context and Signal Handling for cancellation
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
 	defer cancel()
-
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// --- Global Ready State & HTTP Client ---
+	// 4. Prepare Shared State and HTTP Client
 	var allReady atomic.Bool
 	allReady.Store(false)
-	httpClient := &http.Client{
-		Timeout: cfg.RetryInterval / 2,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{ InsecureSkipVerify: cfg.TlsSkipVerify },
-		},
+	readyChan := make(chan struct{}) // Used only if !cfg.StartImmediately
+	var readyOnce sync.Once
+	httpClient := createHTTPClient(cfg)
+
+	// 5. Start Health/Metrics Server
+	httpServer := startHTTPServer(cfg, &allReady)
+	defer shutdownHTTPServer(httpServer) // Ensure server is shut down
+
+	// 6. Start Dependency Checks
+	var wg sync.WaitGroup
+	startDependencyChecks(ctx, cfg, &wg, readyChan, &readyOnce, &allReady, httpClient)
+
+	// 7. Execute Application (conditionally waiting for dependencies)
+	exitCode := executeApplication(ctx, cfg, sigChan, readyChan, &wg)
+
+	// 8. Final Cleanup and Exit
+	slog.Info("Net-Init exiting", "exitCode", exitCode)
+	cancel() // Ensure context is cancelled if not already
+	wg.Wait()  // Wait for dependency checks to fully stop
+	os.Exit(exitCode)
+}
+
+// --- Helper Functions ---
+
+// setupLogging configures the global logger based on environment variables.
+func setupLogging() {
+	logLevel := defaultLogLevel
+	if levelStr := os.Getenv("NETINIT_LOG_LEVEL"); levelStr != "" {
+		var err error
+		logLevel, err = parseLogLevel(levelStr)
+		if err != nil {
+			// Use default logger initially for this error message
+			slog.Error("Invalid NETINIT_LOG_LEVEL, using default", "value", levelStr, "error", err)
+			logLevel = defaultLogLevel
+		}
+	}
+	jsonHandler := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})
+	logger := slog.New(jsonHandler)
+	slog.SetDefault(logger)
+}
+
+// parseLogLevel parses the log level string.
+func parseLogLevel(levelStr string) (slog.Level, error) {
+	switch strings.ToLower(levelStr) {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
+	case "warn":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	case "":
+		return defaultLogLevel, nil // Default for empty
+	default:
+		return defaultLogLevel, fmt.Errorf("unknown log level: %s", levelStr)
+	}
+}
+
+// parseIntEnv parses an integer environment variable with validation.
+func parseIntEnv(key string, defaultVal int, allowZero bool, allowNegative bool) (int, error) {
+	valStr := os.Getenv(key)
+	if valStr == "" {
+		return defaultVal, nil
+	}
+	val, err := strconv.Atoi(valStr)
+	if err != nil {
+		return defaultVal, fmt.Errorf("invalid %s format: %w", key, err)
+	}
+	if !allowZero && val == 0 {
+		return defaultVal, fmt.Errorf("invalid %s: must not be zero", key)
+	}
+	if !allowNegative && val < 0 {
+		return defaultVal, fmt.Errorf("invalid %s: must be non-negative", key)
+	}
+	// Add upper bounds check if needed (e.g., for ports)
+	if key == "NETINIT_HEALTHCHECK_PORT" && (val <= 0 || val > 65535) {
+		return defaultVal, fmt.Errorf("invalid %s value: %d", key, val)
+	}
+	return val, nil
+}
+
+// parseDurationEnv parses a duration (in seconds) environment variable.
+func parseDurationEnv(key string, defaultVal time.Duration, requirePositive bool) (time.Duration, error) {
+	valStr := os.Getenv(key)
+	if valStr == "" {
+		return defaultVal, nil
+	}
+	seconds, err := strconv.Atoi(valStr)
+	if err != nil {
+		return defaultVal, fmt.Errorf("invalid %s format: %w", key, err)
+	}
+	if requirePositive && seconds <= 0 {
+		return defaultVal, fmt.Errorf("invalid %s: must be positive", key)
+	}
+	if !requirePositive && seconds < 0 {
+		return defaultVal, fmt.Errorf("invalid %s: must be non-negative", key)
+	}
+	return time.Duration(seconds) * time.Second, nil
+}
+
+// parseBoolEnv parses a boolean environment variable (true if "true").
+func parseBoolEnv(key string, defaultVal bool) bool {
+	valStr := os.Getenv(key)
+	if valStr == "" {
+		return defaultVal
+	}
+	return strings.ToLower(valStr) == "true"
+}
+
+// parseConfig parses all configuration from environment variables.
+func parseConfig(args []string) (*Config, error) {
+	var err error
+	cfg := &Config{
+		HealthCheckPort:  defaultHealthCheckPort,
+		HealthCheckPath:  defaultHealthCheckPath,
+		MetricsPath:      defaultMetricsPath,
+		Timeout:          defaultTimeout,
+		RetryInterval:    defaultRetryInterval,
+		LogLevel:         defaultLogLevel, // Will be updated below
+		TlsSkipVerify:    false,
+		StartImmediately: false, // Default is to wait
 	}
 
+	// Parse basic types
+	cfg.HealthCheckPort, err = parseIntEnv("NETINIT_HEALTHCHECK_PORT", defaultHealthCheckPort, false, false)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Timeout, err = parseDurationEnv("NETINIT_TIMEOUT", defaultTimeout, false)
+	if err != nil {
+		return nil, err
+	}
+	cfg.RetryInterval, err = parseDurationEnv("NETINIT_RETRY_INTERVAL", defaultRetryInterval, true)
+	if err != nil {
+		return nil, err
+	}
+	customTimeoutSec, err := parseIntEnv("NETINIT_CUSTOM_CHECK_TIMEOUT", int(defaultCustomCheckTimeout.Seconds()), true, false)
+	if err != nil {
+		return nil, err
+	}
+	defaultCustomCheckTimeout = time.Duration(customTimeoutSec) * time.Second // Update global var
 
-	// Channel to signal when dependencies are ready (only used in default mode)
-	readyChan := make(chan struct{})
-	var readyOnce sync.Once // Ensure readyChan is closed only once
+	// Parse paths with validation
+	if path := os.Getenv("NETINIT_HEALTHCHECK_PATH"); path != "" {
+		if !strings.HasPrefix(path, "/") {
+			return nil, fmt.Errorf("invalid NETINIT_HEALTHCHECK_PATH: must start with /")
+		}
+		cfg.HealthCheckPath = path
+	}
+	if path := os.Getenv("NETINIT_METRICS_PATH"); path != "" {
+		if !strings.HasPrefix(path, "/") {
+			return nil, fmt.Errorf("invalid NETINIT_METRICS_PATH: must start with /")
+		}
+		cfg.MetricsPath = path
+	}
 
-	// --- Start Health Check Server ---
+	// Parse LogLevel (allow default on error)
+	logLevelStr := os.Getenv("NETINIT_LOG_LEVEL")
+	parsedLevel, errLog := parseLogLevel(logLevelStr)
+	if errLog != nil {
+		slog.Warn("Invalid NETINIT_LOG_LEVEL specified, using default", "value", logLevelStr, "default", defaultLogLevel.String())
+	}
+	cfg.LogLevel = parsedLevel // Use parsed level or default if error
+
+	// Parse booleans
+	cfg.TlsSkipVerify = parseBoolEnv("NETINIT_TLS_SKIP_VERIFY", false)
+	cfg.StartImmediately = parseBoolEnv("NETINIT_START_IMMEDIATELY", false)
+
+	// Parse other strings
+	cfg.TlsCACertPath = os.Getenv("NETINIT_TLS_CA_CERT_PATH")
+
+	// Parse Dependencies
+	cfg.WaitDeps, err = parseDependencies(os.Getenv("NETINIT_WAIT"))
+	if err != nil {
+		return nil, err
+	}
+
+	cfg.Cmd = args // Assign remaining arguments as the command
+	return cfg, nil
+}
+
+// parseDependencies parses the NETINIT_WAIT string.
+func parseDependencies(waitStr string) ([]Dependency, error) {
+	if waitStr == "" {
+		return nil, nil
+	}
+
+	depStrings := strings.Split(waitStr, ",")
+	deps := make([]Dependency, 0, len(depStrings))
+	uniqueDeps := make(map[string]struct{})
+
+	for _, depRaw := range depStrings {
+		depRaw = strings.TrimSpace(depRaw)
+		if depRaw == "" {
+			continue
+		}
+		if _, exists := uniqueDeps[depRaw]; exists {
+			slog.Warn("Duplicate dependency specified, ignoring.", "dependency", depRaw)
+			continue
+		}
+		uniqueDeps[depRaw] = struct{}{}
+
+		dep, err := parseSingleDependency(depRaw)
+		if err != nil {
+			return nil, err // Propagate error
+		}
+		deps = append(deps, dep)
+	}
+	return deps, nil
+}
+
+// parseSingleDependency parses one dependency string entry.
+func parseSingleDependency(depRaw string) (Dependency, error) {
+	dep := Dependency{Raw: depRaw}
+	parts := strings.SplitN(depRaw, "://", 2)
+
+	if len(parts) == 1 { // Default to TCP
+		target := parts[0]
+		if !strings.Contains(target, ":") {
+			return dep, fmt.Errorf("invalid default TCP dependency format (missing port?): '%s'", depRaw)
+		}
+		dep.Type = "tcp"
+		dep.Target = target
+	} else {
+		depType := strings.ToLower(parts[0])
+		target := parts[1]
+		if target == "" {
+			return dep, fmt.Errorf("missing target for dependency type '%s' in '%s'", depType, depRaw)
+		}
+		dep.Type = depType
+		dep.Target = target
+	}
+
+	// Assign check function based on type
+	switch dep.Type {
+	case "tcp":
+		if !strings.Contains(dep.Target, ":") {
+			return dep, fmt.Errorf("invalid TCP dependency format (missing port?): '%s'", depRaw)
+		}
+		dep.CheckFunc = checkTCP
+	case "udp":
+		if !strings.Contains(dep.Target, ":") {
+			return dep, fmt.Errorf("invalid UDP dependency format (missing port?): '%s'", depRaw)
+		}
+		dep.CheckFunc = checkUDP
+	case "http", "https":
+		dep.CheckFunc = checkHTTP
+	case "exec":
+		cmdParts := strings.Fields(dep.Target)
+		if len(cmdParts) == 0 {
+			return dep, fmt.Errorf("invalid exec dependency format (empty command): '%s'", depRaw)
+		}
+		dep.Target = cmdParts[0] // The command/script path
+		dep.Args = cmdParts[1:]   // The arguments
+		dep.CheckFunc = checkExec
+	default:
+		return dep, fmt.Errorf("unsupported dependency type '%s' in '%s'", dep.Type, depRaw)
+	}
+
+	// Initialize metric
+	dep.Metric = depStatus.WithLabelValues(dep.Raw)
+	return dep, nil
+}
+
+// createHTTPClient creates the shared HTTP client.
+func createHTTPClient(cfg *Config) *http.Client {
+	return &http.Client{
+		Timeout: cfg.RetryInterval / 2, // Sensible default timeout per attempt
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: cfg.TlsSkipVerify,
+				// TODO: Load CA cert from cfg.TlsCACertPath if provided
+			},
+			// Consider adding other transport settings like MaxIdleConnsPerHost
+		},
+	}
+}
+
+// startHTTPServer starts the health and metrics server in a goroutine.
+func startHTTPServer(cfg *Config, allReady *atomic.Bool) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc(cfg.HealthCheckPath, func(w http.ResponseWriter, r *http.Request) {
 		if allReady.Load() {
@@ -142,225 +399,233 @@ func main() {
 		}
 	})
 	mux.Handle(cfg.MetricsPath, promhttp.Handler())
-	httpServer := &http.Server{ Addr: fmt.Sprintf(":%d", cfg.HealthCheckPort), Handler: mux }
+
+	httpServer := &http.Server{
+		Addr:    fmt.Sprintf(":%d", cfg.HealthCheckPort),
+		Handler: mux,
+	}
+
 	go func() {
 		slog.Info("Starting health check server", "address", httpServer.Addr)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("Health check server failed", "error", err)
+			// Consider signaling main goroutine about this fatal error
 		}
 	}()
-	defer func() {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer shutdownCancel()
-		slog.Info("Shutting down health check server...")
-		if err := httpServer.Shutdown(shutdownCtx); err != nil {
-			slog.Error("Health check server shutdown failed", "error", err)
-		}
-	}()
+	return httpServer
+}
 
+// shutdownHTTPServer gracefully shuts down the HTTP server.
+func shutdownHTTPServer(server *http.Server) {
+	if server == nil {
+		return
+	}
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	slog.Info("Shutting down health check server...")
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		slog.Error("Health check server shutdown failed", "error", err)
+	}
+}
 
-	// --- Start Dependency Checks Concurrently ---
-	var wg sync.WaitGroup
-	if len(cfg.WaitDeps) > 0 {
-		for i := range cfg.WaitDeps {
-			wg.Add(1)
-			go func(dep *Dependency) {
-				defer wg.Done()
-				slog.Info("Starting check", "dependency", dep.Raw)
-				ticker := time.NewTicker(cfg.RetryInterval)
-				defer ticker.Stop()
-
-				// Initial check needed before ticker loop starts
-				isInitiallyReady := false
-				func() {
-					checkCtx, checkCancel := context.WithTimeout(ctx, cfg.RetryInterval)
-					defer checkCancel()
-					err := dep.CheckFunc(checkCtx, *dep, httpClient)
-					if err == nil {
-						if !dep.isReady.Load() { // Check if state changes
-							slog.Info("Dependency ready", "dependency", dep.Raw)
-							dep.isReady.Store(true)
-							dep.Metric.Set(1)
-						}
-						isInitiallyReady = true // Mark ready for overall check below
-					} else {
-						slog.Debug("Dependency not ready (initial check)", "dependency", dep.Raw, "error", err)
-						dep.Metric.Set(0) // Ensure metric is 0
-						isInitiallyReady = false
-					}
-				}() // End initial check func
-
-
-				checkOverallReady := func() {
-					if checkAllDependenciesReady(cfg.WaitDeps) {
-						if !allReady.Load() {
-							slog.Info("All dependencies are now ready!")
-							allReady.Store(true)
-							overallStatus.Set(1)
-							readyOnce.Do(func() { close(readyChan) })
-						}
-					} else {
-						if allReady.Load() {
-							slog.Warn("Overall status changed to NOT READY")
-							allReady.Store(false)
-							overallStatus.Set(0)
-						}
-					}
-				}
-                checkOverallReady() // Check after initial check
-
-
-				// Subsequent checks only if not initially ready or if context not done
-				if !isInitiallyReady {
-					for {
-						select {
-						case <-ctx.Done():
-							slog.Warn("Stopping check due to context cancellation", "dependency", dep.Raw, "reason", ctx.Err())
-							if dep.isReady.Load() {
-								dep.isReady.Store(false)
-								dep.Metric.Set(0)
-								checkOverallReady()
-							}
-							return
-						case <-ticker.C:
-							checkCtx, checkCancel := context.WithTimeout(ctx, cfg.RetryInterval)
-							err := dep.CheckFunc(checkCtx, *dep, httpClient)
-							checkCancel()
-
-							stateChanged := false
-							if err == nil {
-								if !dep.isReady.Load() {
-									slog.Info("Dependency ready", "dependency", dep.Raw)
-									dep.isReady.Store(true)
-									dep.Metric.Set(1)
-									stateChanged = true
-								}
-							} else {
-								if dep.isReady.Load() {
-									slog.Warn("Dependency NOT ready (was ready before)", "dependency", dep.Raw, "error", err)
-									dep.isReady.Store(false)
-									dep.Metric.Set(0)
-									stateChanged = true
-								} else {
-									slog.Debug("Dependency not ready", "dependency", dep.Raw, "error", err)
-								}
-							}
-
-							if stateChanged {
-								checkOverallReady()
-							}
-						}
-					}
-				} else {
-                     <-ctx.Done()
-                     slog.Warn("Stopping check (was initially ready) due to context cancellation", "dependency", dep.Raw, "reason", ctx.Err())
-                     if dep.isReady.Load() {
-                         dep.isReady.Store(false)
-                         dep.Metric.Set(0)
-                         checkOverallReady()
-                     }
-                }
-			}(&cfg.WaitDeps[i])
-		}
-	} else {
+// startDependencyChecks launches goroutines for each dependency check.
+func startDependencyChecks(ctx context.Context, cfg *Config, wg *sync.WaitGroup, readyChan chan struct{}, readyOnce *sync.Once, allReady *atomic.Bool, httpClient *http.Client) {
+	if len(cfg.WaitDeps) == 0 {
+		// No dependencies, mark as ready immediately and signal
 		allReady.Store(true)
 		overallStatus.Set(1)
 		slog.Info("No dependencies specified, marking ready immediately.")
 		readyOnce.Do(func() { close(readyChan) })
+		return
 	}
 
-	// --- Start Child Process (Conditional) ---
-	var cmd *exec.Cmd
-	var cmdPath string
-
-	if len(cfg.Cmd) > 0 {
-		var errLookPath error
-		cmdPath, errLookPath = exec.LookPath(cfg.Cmd[0])
-		if errLookPath != nil {
-			slog.Error("Failed to find command executable", "command", cfg.Cmd[0], "error", errLookPath)
-			os.Exit(127)
-		}
-		cmd = exec.Command(cmdPath, cfg.Cmd[1:]...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	} else {
-		slog.Warn("No command specified. Net-init will run checks and serve health endpoints.")
-		if !cfg.StartImmediately && len(cfg.WaitDeps) > 0 {
-			slog.Info("Waiting for dependencies to be ready before idling...")
-			select {
-			case <-readyChan:
-				slog.Info("Dependencies ready. Idling until terminated.")
-			case <-ctx.Done():
-				slog.Error("Timeout reached while waiting for dependencies (no command specified).", "error", ctx.Err())
-				exitCode := 1
-				if errors.Is(ctx.Err(), context.DeadlineExceeded) { exitCode = 124 }
-                cancel()
-				wg.Wait()
-				os.Exit(exitCode)
-			case sig := <-sigChan:
-				slog.Info("Received signal while waiting for dependencies (no command specified). Exiting.", "signal", sig)
-				cancel()
-				wg.Wait()
-				os.Exit(0)
+	checkOverallReady := func() {
+		// This function determines overall readiness and signals via readyChan (once)
+		if checkAllDependenciesReady(cfg.WaitDeps) {
+			if !allReady.Load() {
+				slog.Info("All dependencies are now ready!")
+				allReady.Store(true)
+				overallStatus.Set(1)
+				readyOnce.Do(func() { close(readyChan) }) // Signal readiness once
 			}
 		} else {
-            slog.Info("Idling until terminated (no command specified, start immediately or no deps).")
-        }
-        <-sigChan
-		slog.Info("Received termination signal, exiting.")
-		cancel()
-		wg.Wait()
-		os.Exit(0)
+			if allReady.Load() {
+				slog.Warn("Overall status changed to NOT READY")
+				allReady.Store(false)
+				overallStatus.Set(0)
+			}
+		}
 	}
 
+	for i := range cfg.WaitDeps {
+		wg.Add(1)
+		go func(dep *Dependency) {
+			defer wg.Done()
+			slog.Info("Starting check", "dependency", dep.Raw)
+			ticker := time.NewTicker(cfg.RetryInterval)
+			defer ticker.Stop()
 
-	// --- Main Execution Logic ---
-	exitCode := 0
+			// Perform initial check
+			isInitiallyReady := false
+			func() {
+				checkCtx, checkCancel := context.WithTimeout(ctx, cfg.RetryInterval)
+				defer checkCancel()
+				err := dep.CheckFunc(checkCtx, *dep, httpClient)
+				if err == nil {
+					if !dep.isReady.Load() {
+						slog.Info("Dependency ready", "dependency", dep.Raw)
+						dep.isReady.Store(true)
+						dep.Metric.Set(1)
+					}
+					isInitiallyReady = true
+				} else {
+					slog.Debug("Dependency not ready (initial check)", "dependency", dep.Raw, "error", err)
+					dep.Metric.Set(0)
+					isInitiallyReady = false
+				}
+			}()
+			checkOverallReady() // Check overall status after initial check
+
+			// Subsequent checks loop
+			if !isInitiallyReady {
+				for {
+					select {
+					case <-ctx.Done():
+						slog.Warn("Stopping check due to context cancellation", "dependency", dep.Raw, "reason", ctx.Err())
+						if dep.isReady.Load() {
+							dep.isReady.Store(false); dep.Metric.Set(0); checkOverallReady()
+						}
+						return
+					case <-ticker.C:
+						checkCtx, checkCancel := context.WithTimeout(ctx, cfg.RetryInterval)
+						err := dep.CheckFunc(checkCtx, *dep, httpClient)
+						checkCancel()
+						stateChanged := false
+						if err == nil {
+							if !dep.isReady.Load() {
+								slog.Info("Dependency ready", "dependency", dep.Raw); dep.isReady.Store(true); dep.Metric.Set(1); stateChanged = true
+							}
+						} else {
+							if dep.isReady.Load() {
+								slog.Warn("Dependency NOT ready (was ready before)", "dependency", dep.Raw, "error", err); dep.isReady.Store(false); dep.Metric.Set(0); stateChanged = true
+							} else {
+								slog.Debug("Dependency not ready", "dependency", dep.Raw, "error", err)
+							}
+						}
+						if stateChanged { checkOverallReady() }
+					}
+				}
+			} else {
+				// If initially ready, just wait for context cancellation
+				<-ctx.Done()
+				slog.Warn("Stopping check (was initially ready) due to context cancellation", "dependency", dep.Raw, "reason", ctx.Err())
+				if dep.isReady.Load() {
+					dep.isReady.Store(false); dep.Metric.Set(0); checkOverallReady()
+				}
+			}
+		}(&cfg.WaitDeps[i])
+	}
+}
+
+// checkAllDependenciesReady checks the atomic flags for all dependencies.
+func checkAllDependenciesReady(deps []Dependency) bool {
+	if len(deps) == 0 {
+		return true
+	}
+	for i := range deps {
+		if !deps[i].isReady.Load() {
+			return false
+		}
+	}
+	return true
+}
+
+// executeApplication handles the logic for maybe waiting, starting, and managing the child process.
+func executeApplication(ctx context.Context, cfg *Config, sigChan chan os.Signal, readyChan chan struct{}, wg *sync.WaitGroup) (exitCode int) {
+	exitCode = 0 // Default success
 	exitChan := make(chan error, 1)
+	var cmd *exec.Cmd
 
+	// --- Prepare Command ---
+	if len(cfg.Cmd) == 0 {
+		slog.Warn("No command specified.")
+		handleNoCommand(ctx, cfg, sigChan, readyChan, wg) // Handle idling
+		return 0 // Exit cleanly if signaled while idling
+	}
+	cmdPath, err := exec.LookPath(cfg.Cmd[0])
+	if err != nil {
+		slog.Error("Failed to find command executable", "command", cfg.Cmd[0], "error", err)
+		return 127 // Standard exit code for command not found
+	}
+	cmd = exec.Command(cmdPath, cfg.Cmd[1:]...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	// --- Wait or Start Immediately ---
+	// childStarted := false // REMOVED: declared and not used
 	if !cfg.StartImmediately {
-		// --- Default: Wait for Dependencies First ---
 		slog.Info("Waiting for dependencies before starting command...")
 		select {
 		case <-readyChan:
 			slog.Info("Dependencies ready. Starting command.")
-			err = cmd.Start()
-			if err != nil {
-				slog.Error("Failed to start command after dependencies ready", "command", cmdPath, "error", err)
-				os.Exit(126)
-			}
-			slog.Info("Child process started", "pid", cmd.Process.Pid)
-			go func() { exitChan <- cmd.Wait() }()
-
+			// Proceed to start below
 		case <-ctx.Done():
 			slog.Error("Timeout reached while waiting for dependencies.", "error", ctx.Err())
 			exitCode = 1
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) { exitCode = 124 }
-            cancel()
-            wg.Wait()
-			os.Exit(exitCode)
-
+			return exitCode // Exit before starting child
 		case sig := <-sigChan:
 			slog.Info("Received signal while waiting for dependencies. Exiting.", "signal", sig)
-            cancel()
-			wg.Wait()
-			os.Exit(0)
+			return 0 // Exit cleanly on signal before starting child
 		}
-	} else {
-		// --- Optional: Start Immediately ---
-		slog.Info("Starting command immediately.")
-		err = cmd.Start()
-		if err != nil {
-			slog.Error("Failed to start command immediately", "command", cmdPath, "error", err)
-			os.Exit(126)
-		}
-		slog.Info("Child process started", "pid", cmd.Process.Pid)
-		go func() { exitChan <- cmd.Wait() }()
 	}
 
+	// --- Start Child Process ---
+	slog.Info("Starting child command", "command", strings.Join(cfg.Cmd, " "))
+	err = cmd.Start()
+	if err != nil {
+		slog.Error("Failed to start command", "command", cmdPath, "error", err)
+		return 126 // Standard exit code for command invoked cannot execute
+	}
+	// childStarted = true // REMOVED: declared and not used
+	slog.Info("Child process started", "pid", cmd.Process.Pid)
+	go func() { exitChan <- cmd.Wait() }() // Wait for exit in background
 
-	// --- Signal Handling / Wait Loop (runs only if child was started) ---
+	// --- Handle Signals and Wait for Child Exit ---
+	exitCode = handleSignalsAndWait(sigChan, exitChan, cmd)
+	return exitCode
+}
+
+// handleNoCommand handles the case where no CMD is provided.
+func handleNoCommand(ctx context.Context, cfg *Config, sigChan chan os.Signal, readyChan chan struct{}, wg *sync.WaitGroup) {
+	if !cfg.StartImmediately && len(cfg.WaitDeps) > 0 {
+		slog.Info("Waiting for dependencies to be ready before idling...")
+		select {
+		case <-readyChan:
+			slog.Info("Dependencies ready. Idling until terminated.")
+		case <-ctx.Done():
+			slog.Error("Timeout reached while waiting for dependencies (no command specified). Exiting.", "error", ctx.Err())
+			// exitCode := 1 // REMOVED: declared and not used
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				// exitCode = 124 // REMOVED: declared and not used
+			}
+			return // Let main handle final exit
+		case sig := <-sigChan:
+			slog.Info("Received signal while waiting for dependencies (no command specified). Exiting.", "signal", sig)
+			return // Let main handle final exit
+		}
+	} else {
+		slog.Info("Idling until terminated (no command specified, start immediately or no deps).")
+	}
+	// Wait indefinitely for signal if no command
+	sig := <-sigChan // Wait for termination signal
+	slog.Info("Received termination signal while idling. Exiting.", "signal", sig)
+}
+
+// handleSignalsAndWait manages signal forwarding and waits for the child process to exit.
+func handleSignalsAndWait(sigChan chan os.Signal, exitChan chan error, cmd *exec.Cmd) (exitCode int) {
+	exitCode = 0
 	keepRunning := true
 	for keepRunning {
 		select {
@@ -376,11 +641,11 @@ func main() {
 					}
 				}
 			} else {
-                slog.Warn("Received signal but child process is not running.")
-                keepRunning = false
-            }
+				slog.Warn("Received signal but child process is not running.")
+				keepRunning = false
+			}
 
-		case err = <-exitChan:
+		case err := <-exitChan:
 			slog.Info("Child process exited.")
 			if err != nil {
 				if exitError, ok := err.(*exec.ExitError); ok {
@@ -395,142 +660,7 @@ func main() {
 			keepRunning = false
 		}
 	}
-
-
-	slog.Info("Net-Init exiting", "exitCode", exitCode)
-	cancel()
-	wg.Wait()
-	os.Exit(exitCode)
-}
-
-
-// --- Helper Functions ---
-
-func parseLogLevel(levelStr string) (slog.Level, error) {
-	switch strings.ToLower(levelStr) {
-	case "debug": return slog.LevelDebug, nil
-	case "info": return slog.LevelInfo, nil
-	case "warn": return slog.LevelWarn, nil
-	case "error": return slog.LevelError, nil
-	case "": return defaultLogLevel, nil // Default for empty
-	default: return defaultLogLevel, fmt.Errorf("unknown log level: %s", levelStr)
-	}
-}
-
-func parseConfig(args []string) (*Config, error) {
-	cfg := &Config{
-		HealthCheckPort:  defaultHealthCheckPort,
-		HealthCheckPath:  defaultHealthCheckPath,
-		MetricsPath:      defaultMetricsPath,
-		Timeout:          defaultTimeout,
-		RetryInterval:    defaultRetryInterval,
-		LogLevel:         defaultLogLevel,
-		TlsSkipVerify:    false,
-		StartImmediately: false, // Default is to wait
-	}
-
-	// --- Parse Env Vars ---
-	if portStr := os.Getenv("NETINIT_HEALTHCHECK_PORT"); portStr != "" {
-		if port, err := strconv.Atoi(portStr); err == nil {
-			if port > 0 && port <= 65535 { cfg.HealthCheckPort = port
-			} else { return nil, fmt.Errorf("invalid NETINIT_HEALTHCHECK_PORT value: %d", port) }
-		} else { return nil, fmt.Errorf("invalid NETINIT_HEALTHCHECK_PORT format: %w", err) }
-	}
-	if path := os.Getenv("NETINIT_HEALTHCHECK_PATH"); path != "" {
-		if !strings.HasPrefix(path, "/") { return nil, fmt.Errorf("invalid NETINIT_HEALTHCHECK_PATH: must start with /") }
-		cfg.HealthCheckPath = path
-	}
-	if path := os.Getenv("NETINIT_METRICS_PATH"); path != "" {
-		if !strings.HasPrefix(path, "/") { return nil, fmt.Errorf("invalid NETINIT_METRICS_PATH: must start with /") }
-		cfg.MetricsPath = path
-	}
-	if timeoutStr := os.Getenv("NETINIT_TIMEOUT"); timeoutStr != "" {
-		if timeout, err := strconv.Atoi(timeoutStr); err == nil {
-			if timeout >= 0 { cfg.Timeout = time.Duration(timeout) * time.Second
-			} else { return nil, fmt.Errorf("invalid NETINIT_TIMEOUT: must be non-negative") }
-		} else { return nil, fmt.Errorf("invalid NETINIT_TIMEOUT format: %w", err) }
-	}
-	if intervalStr := os.Getenv("NETINIT_RETRY_INTERVAL"); intervalStr != "" {
-		if interval, err := strconv.Atoi(intervalStr); err == nil {
-			if interval > 0 { cfg.RetryInterval = time.Duration(interval) * time.Second
-			} else { return nil, fmt.Errorf("invalid NETINIT_RETRY_INTERVAL: must be positive") }
-		} else { return nil, fmt.Errorf("invalid NETINIT_RETRY_INTERVAL format: %w", err) }
-	}
-	if customTimeoutStr := os.Getenv("NETINIT_CUSTOM_CHECK_TIMEOUT"); customTimeoutStr != "" {
-		if customTimeout, err := strconv.Atoi(customTimeoutStr); err == nil && customTimeout > 0 {
-			defaultCustomCheckTimeout = time.Duration(customTimeout) * time.Second
-		} else { return nil, fmt.Errorf("invalid NETINIT_CUSTOM_CHECK_TIMEOUT: %s", customTimeoutStr) }
-	}
-	logLevelStr := os.Getenv("NETINIT_LOG_LEVEL")
-	parsedLevel, err := parseLogLevel(logLevelStr)
-	if err != nil { slog.Warn("Invalid NETINIT_LOG_LEVEL", "value", logLevelStr, "error", err) }
-	cfg.LogLevel = parsedLevel
-	if skipVerifyStr := os.Getenv("NETINIT_TLS_SKIP_VERIFY"); skipVerifyStr == "true" {
-		cfg.TlsSkipVerify = true
-	}
-	cfg.TlsCACertPath = os.Getenv("NETINIT_TLS_CA_CERT_PATH")
-	if startImmediatelyStr := os.Getenv("NETINIT_START_IMMEDIATELY"); startImmediatelyStr == "true" {
-		cfg.StartImmediately = true
-	}
-
-	// Parse Dependencies
-	waitStr := os.Getenv("NETINIT_WAIT")
-	if waitStr != "" {
-		depStrings := strings.Split(waitStr, ",")
-		cfg.WaitDeps = make([]Dependency, 0, len(depStrings))
-		uniqueDeps := make(map[string]struct{})
-		for _, depRaw := range depStrings {
-			depRaw = strings.TrimSpace(depRaw)
-			if depRaw == "" { continue }
-			if _, exists := uniqueDeps[depRaw]; exists {
-				slog.Warn("Duplicate dependency specified, ignoring.", "dependency", depRaw)
-				continue
-			}
-			uniqueDeps[depRaw] = struct{}{}
-			dep := Dependency{Raw: depRaw}
-			parts := strings.SplitN(depRaw, "://", 2)
-			if len(parts) == 1 {
-				if !strings.Contains(parts[0], ":") { return nil, fmt.Errorf("invalid default TCP format: '%s'", depRaw)}
-				dep.Type = "tcp"
-				dep.Target = parts[0]
-			} else {
-				dep.Type = strings.ToLower(parts[0])
-				dep.Target = parts[1]
-				if dep.Target == "" { return nil, fmt.Errorf("missing target for type '%s' in '%s'", dep.Type, depRaw)}
-			}
-			switch dep.Type {
-			case "tcp":
-				if !strings.Contains(dep.Target, ":") { return nil, fmt.Errorf("invalid TCP format: '%s'", depRaw)}
-				dep.CheckFunc = checkTCP
-			case "udp":
-				if !strings.Contains(dep.Target, ":") { return nil, fmt.Errorf("invalid UDP format: '%s'", depRaw)}
-				dep.CheckFunc = checkUDP
-			case "http", "https":
-				dep.CheckFunc = checkHTTP
-			case "exec":
-				cmdParts := strings.Fields(dep.Target)
-				if len(cmdParts) == 0 { return nil, fmt.Errorf("invalid exec format: '%s'", depRaw)}
-				dep.Target = cmdParts[0]
-				dep.Args = cmdParts[1:]
-				dep.CheckFunc = checkExec
-			default:
-				return nil, fmt.Errorf("unsupported dependency type '%s' in '%s'", dep.Type, depRaw)
-			}
-			dep.Metric = depStatus.WithLabelValues(dep.Raw)
-			cfg.WaitDeps = append(cfg.WaitDeps, dep)
-		}
-	}
-	cfg.Cmd = args
-	return cfg, nil
-}
-
-
-func checkAllDependenciesReady(deps []Dependency) bool {
-	if len(deps) == 0 { return true }
-	for i := range deps {
-		if !deps[i].isReady.Load() { return false }
-	}
-	return true
+	return exitCode
 }
 
 // --- Specific Check Functions ---
