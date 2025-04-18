@@ -183,6 +183,78 @@ func testDependencyValues(t *testing.T, deps []Dependency, expectedTypes []strin
 	}
 }
 
+// testValidOverrideDependencies verifies the dependency parsing in valid overrides
+func testValidOverrideDependencies(t *testing.T, cfg *Config) {
+	t.Helper()
+
+	if len(cfg.WaitDeps) != 2 {
+		t.Fatalf("WaitDeps count wrong: got %d, want 2", len(cfg.WaitDeps))
+	}
+	if cfg.WaitDeps[0].Raw != "tcp://db:1234" {
+		t.Errorf("WaitDep[0] wrong: %s", cfg.WaitDeps[0].Raw)
+	}
+	if cfg.WaitDeps[1].Raw != "https://api.com/status" {
+		t.Errorf("WaitDep[1] wrong: %s", cfg.WaitDeps[1].Raw)
+	}
+}
+
+// testExplicitStartValues verifies different settings for START_IMMEDIATELY
+func testExplicitStartValues(t *testing.T, setenv func(t *testing.T, key, value string), baseArgs []string) {
+	t.Helper()
+
+	// Test explicit false
+	t.Run("ExplicitStartFalse", func(t *testing.T) {
+		setenv(t, "NETINIT_START_IMMEDIATELY", "false")
+		cfgFalse, errFalse := parseConfig(baseArgs)
+		if errFalse != nil {
+			t.Fatalf("parseConfig() with StartImmediately=false failed: %v", errFalse)
+		}
+		if cfgFalse.StartImmediately != false {
+			t.Errorf("StartImmediately=false override failed: got %t, want %t", cfgFalse.StartImmediately, false)
+		}
+	})
+
+	// Test invalid value (should default to false)
+	t.Run("InvalidStartValue", func(t *testing.T) {
+		setenv(t, "NETINIT_START_IMMEDIATELY", "yes")
+		cfgInvalid, errInvalid := parseConfig(baseArgs)
+		if errInvalid != nil {
+			t.Fatalf("parseConfig() with StartImmediately=yes failed: %v", errInvalid)
+		}
+		if cfgInvalid.StartImmediately != false {
+			t.Errorf("StartImmediately=yes override failed (should default to false): got %t, want %t",
+				cfgInvalid.StartImmediately, false)
+		}
+	})
+}
+
+// runInvalidValueTest runs a test for an invalid config value
+func runInvalidValueTest(t *testing.T, tc struct{ key, val string }, setenv func(t *testing.T, key, value string), baseArgs []string, originalTimeout time.Duration) {
+	t.Helper()
+
+	// Reset environment and set one invalid value
+	setenv(t, tc.key, tc.val)
+
+	// Reset global var before testing custom timeout
+	if tc.key == "NETINIT_CUSTOM_CHECK_TIMEOUT" {
+		defaultCustomCheckTimeout = originalTimeout
+	}
+
+	// Parse with the invalid value
+	_, err := parseConfig(baseArgs)
+
+	// Special case for log level which uses default on error
+	if err == nil {
+		if tc.key == "NETINIT_LOG_LEVEL" {
+			t.Logf("Ignoring expected nil error for invalid NETINIT_LOG_LEVEL (uses default)")
+		} else {
+			t.Errorf("Expected error for %s=%s, but got nil", tc.key, tc.val)
+		}
+	} else {
+		t.Logf("Got expected error for %s=%s: %v", tc.key, tc.val, err)
+	}
+}
+
 // TestParseConfig verifies config parsing from environment variables
 func TestParseConfig(t *testing.T) {
 	// Helper to set env vars and cleanup
@@ -197,6 +269,7 @@ func TestParseConfig(t *testing.T) {
 	originalCustomCheckTimeoutVar := defaultCustomCheckTimeout
 	t.Cleanup(func() { defaultCustomCheckTimeout = originalCustomCheckTimeoutVar })
 
+	// Test default configuration
 	t.Run("Defaults", func(t *testing.T) {
 		// Reset global var to its original default for this test run
 		defaultCustomCheckTimeout = originalCustomCheckTimeoutVar
@@ -209,6 +282,7 @@ func TestParseConfig(t *testing.T) {
 		testDefaultConfig(t, cfg, baseArgs, originalCustomCheckTimeoutVar)
 	})
 
+	// Test valid configuration overrides
 	t.Run("ValidOverrides", func(t *testing.T) {
 		// Setup all environment variables
 		setenv(t, "NETINIT_HEALTHCHECK_PORT", "9090")
@@ -235,42 +309,13 @@ func TestParseConfig(t *testing.T) {
 		testOverrideValues(t, cfg, expectedCustomTimeout)
 
 		// Test dependency parsing
-		if len(cfg.WaitDeps) != 2 {
-			t.Fatalf("WaitDeps count wrong: got %d, want 2", len(cfg.WaitDeps))
-		}
-		if cfg.WaitDeps[0].Raw != "tcp://db:1234" {
-			t.Errorf("WaitDep[0] wrong: %s", cfg.WaitDeps[0].Raw)
-		}
-		if cfg.WaitDeps[1].Raw != "https://api.com/status" {
-			t.Errorf("WaitDep[1] wrong: %s", cfg.WaitDeps[1].Raw)
-		}
+		testValidOverrideDependencies(t, cfg)
 
-		// Test StartImmediately=false explicit override
-		t.Run("ExplicitStartFalse", func(t *testing.T) {
-			setenv(t, "NETINIT_START_IMMEDIATELY", "false")
-			cfgFalse, errFalse := parseConfig(baseArgs)
-			if errFalse != nil {
-				t.Fatalf("parseConfig() with StartImmediately=false failed: %v", errFalse)
-			}
-			if cfgFalse.StartImmediately != false {
-				t.Errorf("StartImmediately=false override failed: got %t, want %t", cfgFalse.StartImmediately, false)
-			}
-		})
-
-		// Test StartImmediately with invalid value (should default to false)
-		t.Run("InvalidStartValue", func(t *testing.T) {
-			setenv(t, "NETINIT_START_IMMEDIATELY", "yes")
-			cfgInvalid, errInvalid := parseConfig(baseArgs)
-			if errInvalid != nil {
-				t.Fatalf("parseConfig() with StartImmediately=yes failed: %v", errInvalid)
-			}
-			if cfgInvalid.StartImmediately != false {
-				t.Errorf("StartImmediately=yes override failed (should default to false): got %t, want %t",
-					cfgInvalid.StartImmediately, false)
-			}
-		})
+		// Test StartImmediately variations
+		testExplicitStartValues(t, setenv, baseArgs)
 	})
 
+	// Test invalid configuration values
 	t.Run("InvalidValues", func(t *testing.T) {
 		testCases := []struct{ key, val string }{
 			{"NETINIT_HEALTHCHECK_PORT", "abc"},
@@ -294,31 +339,12 @@ func TestParseConfig(t *testing.T) {
 
 		for _, tc := range testCases {
 			t.Run(fmt.Sprintf("Invalid_%s=%s", tc.key, tc.val), func(t *testing.T) {
-				// Reset environment and set one invalid value
-				setenv(t, tc.key, tc.val)
-
-				// Reset global var before testing custom timeout
-				if tc.key == "NETINIT_CUSTOM_CHECK_TIMEOUT" {
-					defaultCustomCheckTimeout = originalCustomCheckTimeoutVar
-				}
-
-				// Parse with the invalid value
-				_, err := parseConfig(baseArgs)
-
-				// Special case for log level which uses default on error
-				if err == nil {
-					if tc.key == "NETINIT_LOG_LEVEL" {
-						t.Logf("Ignoring expected nil error for invalid NETINIT_LOG_LEVEL (uses default)")
-					} else {
-						t.Errorf("Expected error for %s=%s, but got nil", tc.key, tc.val)
-					}
-				} else {
-					t.Logf("Got expected error for %s=%s: %v", tc.key, tc.val, err)
-				}
+				runInvalidValueTest(t, tc, setenv, baseArgs, originalCustomCheckTimeoutVar)
 			})
 		}
 	})
 
+	// Test dependency parsing
 	t.Run("DependencyParsing", func(t *testing.T) {
 		scriptPath, _ := createDummyScript(t, "test.sh", "exit 0")
 
@@ -342,6 +368,7 @@ func TestParseConfig(t *testing.T) {
 		}
 	})
 
+	// Test no command arguments
 	t.Run("NoCommandArgs", func(t *testing.T) {
 		setenv(t, "NETINIT_WAIT", "tcp://db:5432")
 		cfg, err := parseConfig(nil) // No command args

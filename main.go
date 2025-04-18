@@ -493,44 +493,67 @@ func createOverallReadyChecker(deps []Dependency, allReady *atomic.Bool, readyOn
 	}
 }
 
+// handleNoDependencies marks the system as ready when no dependencies are specified
+func handleNoDependencies(allReady *atomic.Bool, readyOnce *sync.Once, readyChan chan struct{}) {
+	allReady.Store(true)
+	overallStatus.Set(1)
+	slog.Info("No dependencies specified, marking ready immediately.")
+	readyOnce.Do(func() { close(readyChan) })
+}
+
+// startDependencyCheck launches a single dependency check goroutine
+func startDependencyCheck(
+	ctx context.Context,
+	dep *Dependency,
+	wg *sync.WaitGroup,
+	retryInterval time.Duration,
+	httpClient *http.Client,
+	checkOverallReady func(),
+) {
+	defer wg.Done()
+	slog.Info("Starting check", "dependency", dep.Raw)
+	ticker := time.NewTicker(retryInterval)
+	defer ticker.Stop()
+
+	// Perform initial check
+	err := performDependencyCheck(ctx, dep, httpClient, retryInterval)
+	isInitiallyReady := err == nil
+
+	// Update status based on initial check
+	if !isInitiallyReady {
+		dep.Metric.Set(0)
+	}
+	handleDependencyStateChange(dep, isInitiallyReady, err, checkOverallReady)
+
+	// Subsequent checks
+	if !isInitiallyReady {
+		monitorDependency(ctx, dep, ticker, httpClient, retryInterval, checkOverallReady)
+	} else {
+		waitForCancellation(ctx, dep, checkOverallReady)
+	}
+}
+
 // startDependencyChecks launches goroutines for each dependency check.
 func startDependencyChecks(ctx context.Context, cfg *Config, wg *sync.WaitGroup, readyChan chan struct{}, readyOnce *sync.Once, allReady *atomic.Bool, httpClient *http.Client) {
 	if len(cfg.WaitDeps) == 0 {
 		// No dependencies, mark as ready immediately and signal
-		allReady.Store(true)
-		overallStatus.Set(1)
-		slog.Info("No dependencies specified, marking ready immediately.")
-		readyOnce.Do(func() { close(readyChan) })
+		handleNoDependencies(allReady, readyOnce, readyChan)
 		return
 	}
 
 	checkOverallReady := createOverallReadyChecker(cfg.WaitDeps, allReady, readyOnce, readyChan)
 
+	// Launch a goroutine for each dependency
 	for i := range cfg.WaitDeps {
 		wg.Add(1)
-		go func(dep *Dependency) {
-			defer wg.Done()
-			slog.Info("Starting check", "dependency", dep.Raw)
-			ticker := time.NewTicker(cfg.RetryInterval)
-			defer ticker.Stop()
-
-			// Perform initial check
-			err := performDependencyCheck(ctx, dep, httpClient, cfg.RetryInterval)
-			isInitiallyReady := err == nil
-
-			// Update status based on initial check
-			if !isInitiallyReady {
-				dep.Metric.Set(0)
-			}
-			handleDependencyStateChange(dep, isInitiallyReady, err, checkOverallReady)
-
-			// Subsequent checks
-			if !isInitiallyReady {
-				monitorDependency(ctx, dep, ticker, httpClient, cfg.RetryInterval, checkOverallReady)
-			} else {
-				waitForCancellation(ctx, dep, checkOverallReady)
-			}
-		}(&cfg.WaitDeps[i])
+		go startDependencyCheck(
+			ctx,
+			&cfg.WaitDeps[i],
+			wg,
+			cfg.RetryInterval,
+			httpClient,
+			checkOverallReady,
+		)
 	}
 }
 
