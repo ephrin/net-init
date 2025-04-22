@@ -1,25 +1,43 @@
 package dependencies
 
 import (
-	"context"
 	"fmt"
-	"net/http"
 	"strings"
 	"sync/atomic"
 
-	"github.com/ephrin/net-init/pkg/checks"
+	"github.com/ephrin/net-init/pkg/checkers"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
 // Dependency represents a network or executable dependency to wait for
 type Dependency struct {
-	Raw       string                                                 // Raw dependency string as specified by user
-	Type      string                                                 // Type of dependency (tcp, http, etc.)
-	Target    string                                                 // Target address/path
-	Args      []string                                               // Arguments (for exec type)
-	IsReady   atomic.Bool                                            // Whether the dependency is ready
-	CheckFunc func(context.Context, interface{}, *http.Client) error // Function to check dependency status
-	Metric    prometheus.Gauge                                       // Prometheus metric for this dependency
+	Raw       string                // Raw dependency string as specified by user
+	Type      string                // Type of dependency (tcp, http, etc.)
+	Target    string                // Target address/path
+	Args      []string              // Arguments (for exec type)
+	IsReady   atomic.Bool           // Whether the dependency is ready
+	CheckFunc checkers.CheckFunc    // Function to check dependency status
+	Metric    prometheus.Gauge      // Prometheus metric for this dependency
+}
+
+// GetTarget implements the DependencyInfo interface
+func (d *Dependency) GetTarget() string {
+	return d.Target
+}
+
+// GetType implements the DependencyInfo interface
+func (d *Dependency) GetType() string {
+	return d.Type
+}
+
+// GetArgs implements the DependencyInfo interface
+func (d *Dependency) GetArgs() []string {
+	return d.Args
+}
+
+// GetRaw implements the DependencyInfo interface
+func (d *Dependency) GetRaw() string {
+	return d.Raw
 }
 
 // NewDependencies parses raw dependency strings into Dependency objects
@@ -65,14 +83,14 @@ func parseSingleDependency(depRaw string, statusGauge *prometheus.GaugeVec) (Dep
 		if !strings.Contains(dep.Target, ":") {
 			return dep, fmt.Errorf("invalid TCP dependency format (missing port?): '%s'", depRaw)
 		}
-		dep.CheckFunc = checks.CheckTCP
+		dep.CheckFunc = checkers.CheckTCP
 	case "udp":
 		if !strings.Contains(dep.Target, ":") {
 			return dep, fmt.Errorf("invalid UDP dependency format (missing port?): '%s'", depRaw)
 		}
-		dep.CheckFunc = checks.CheckUDP
+		dep.CheckFunc = checkers.CheckUDP
 	case "http", "https":
-		dep.CheckFunc = checks.CheckHTTP
+		dep.CheckFunc = checkers.CheckHTTP
 	case "exec":
 		cmdParts := strings.Fields(dep.Target)
 		if len(cmdParts) == 0 {
@@ -80,7 +98,7 @@ func parseSingleDependency(depRaw string, statusGauge *prometheus.GaugeVec) (Dep
 		}
 		dep.Target = cmdParts[0] // The command/script path
 		dep.Args = cmdParts[1:]  // The arguments
-		dep.CheckFunc = checks.CheckExec
+		dep.CheckFunc = checkers.CheckExec
 	default:
 		return dep, fmt.Errorf("unsupported dependency type '%s' in '%s'", dep.Type, depRaw)
 	}

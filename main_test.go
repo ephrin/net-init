@@ -24,6 +24,26 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+// TestDependencyInfo is a mock implementation of checkers.DependencyInfo for testing
+type TestDependencyInfo struct {
+	Target string
+	Type   string
+	Raw    string
+	Args   []string
+}
+
+// GetTarget implements checkers.DependencyInfo
+func (d TestDependencyInfo) GetTarget() string { return d.Target }
+
+// GetType implements checkers.DependencyInfo
+func (d TestDependencyInfo) GetType() string { return d.Type }
+
+// GetArgs implements checkers.DependencyInfo
+func (d TestDependencyInfo) GetArgs() []string { return d.Args }
+
+// GetRaw implements checkers.DependencyInfo
+func (d TestDependencyInfo) GetRaw() string { return d.Raw }
+
 // --- Test Helper Functions ---
 
 // createDummyScript creates a simple shell script for testing exec checks.
@@ -440,11 +460,9 @@ func TestCheckTCP(t *testing.T) {
 	defer ln.Close()
 
 	// Test with a working TCP server
-	dep := struct {
-		Target string
-		Raw    string
-	}{
+	dep := TestDependencyInfo{
 		Target: serverAddr,
+		Type:   "tcp",
 		Raw:    "tcp://" + serverAddr,
 	}
 
@@ -456,11 +474,9 @@ func TestCheckTCP(t *testing.T) {
 	}
 
 	// Test with an invalid port
-	depFail := struct {
-		Target string
-		Raw    string
-	}{
+	depFail := TestDependencyInfo{
 		Target: "localhost:1",
+		Type:   "tcp",
 		Raw:    "tcp://localhost:1",
 	}
 
@@ -474,11 +490,9 @@ func TestCheckTCP(t *testing.T) {
 	}
 
 	// Test with non-existent hostname to verify DNS resolution check
-	depDNSFail := struct {
-		Target string
-		Raw    string
-	}{
+	depDNSFail := TestDependencyInfo{
 		Target: "nonexistent-host-that-should-not-resolve.local:80",
+		Type:   "tcp",
 		Raw:    "tcp://nonexistent-host-that-should-not-resolve.local:80",
 	}
 
@@ -493,10 +507,10 @@ func TestCheckTCP(t *testing.T) {
 }
 
 func TestCheckUDP(t *testing.T) {
-	depFail := struct {
-		Target string
-	}{
+	depFail := TestDependencyInfo{
 		Target: "localhost:1",
+		Type:   "udp",
+		Raw:    "udp://localhost:1",
 	}
 
 	ctxFail, cancelFail := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -509,10 +523,10 @@ func TestCheckUDP(t *testing.T) {
 		t.Logf("CheckUDP for likely closed port returned no error (also potentially expected)")
 	}
 
-	depLoopback := struct {
-		Target string
-	}{
+	depLoopback := TestDependencyInfo{
 		Target: "127.0.0.1:12345",
+		Type:   "udp",
+		Raw:    "udp://127.0.0.1:12345",
 	}
 
 	ctxLoopback, cancelLoopback := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -573,11 +587,7 @@ func TestCheckHTTP(t *testing.T) {
 	}{
 		{
 			"HTTPOk",
-			struct {
-				Target string
-				Type   string
-				Raw    string
-			}{
+			TestDependencyInfo{
 				Target: serverOk.URL,
 				Type:   "http",
 				Raw:    "http://" + serverOk.URL,
@@ -589,11 +599,7 @@ func TestCheckHTTP(t *testing.T) {
 		},
 		{
 			"HTTPRedirect",
-			struct {
-				Target string
-				Type   string
-				Raw    string
-			}{
+			TestDependencyInfo{
 				Target: serverRedirect.URL,
 				Type:   "http",
 				Raw:    "http://" + serverRedirect.URL,
@@ -605,11 +611,7 @@ func TestCheckHTTP(t *testing.T) {
 		},
 		{
 			"HTTPFailStatus",
-			struct {
-				Target string
-				Type   string
-				Raw    string
-			}{
+			TestDependencyInfo{
 				Target: serverFail.URL,
 				Type:   "http",
 				Raw:    "http://" + serverFail.URL,
@@ -621,11 +623,7 @@ func TestCheckHTTP(t *testing.T) {
 		},
 		{
 			"HTTPTimeout",
-			struct {
-				Target string
-				Type   string
-				Raw    string
-			}{
+			TestDependencyInfo{
 				Target: serverTimeout.URL,
 				Type:   "http",
 				Raw:    "http://" + serverTimeout.URL,
@@ -637,11 +635,7 @@ func TestCheckHTTP(t *testing.T) {
 		},
 		{
 			"HTTPInvalidURL",
-			struct {
-				Target string
-				Type   string
-				Raw    string
-			}{
+			TestDependencyInfo{
 				Target: "http://invalid host:",
 				Type:   "http",
 				Raw:    "http://invalid host:",
@@ -653,11 +647,7 @@ func TestCheckHTTP(t *testing.T) {
 		},
 		{
 			"HTTPSOkTrusted",
-			struct {
-				Target string
-				Type   string
-				Raw    string
-			}{
+			TestDependencyInfo{
 				Target: serverTLS.URL,
 				Type:   "https",
 				Raw:    serverTLS.URL,
@@ -669,11 +659,7 @@ func TestCheckHTTP(t *testing.T) {
 		},
 		{
 			"HTTPSFailUntrusted",
-			struct {
-				Target string
-				Type   string
-				Raw    string
-			}{
+			TestDependencyInfo{
 				Target: serverTLS.URL,
 				Type:   "https",
 				Raw:    serverTLS.URL,
@@ -685,11 +671,7 @@ func TestCheckHTTP(t *testing.T) {
 		},
 		{
 			"HTTPSOkSkipVerify",
-			struct {
-				Target string
-				Type   string
-				Raw    string
-			}{
+			TestDependencyInfo{
 				Target: serverTLS.URL,
 				Type:   "https",
 				Raw:    serverTLS.URL,
@@ -701,11 +683,7 @@ func TestCheckHTTP(t *testing.T) {
 		},
 		{
 			"HTTPSOkTargetNoScheme",
-			struct {
-				Target string
-				Type   string
-				Raw    string
-			}{
+			TestDependencyInfo{
 				Target: strings.TrimPrefix(serverTLS.URL, "https://"),
 				Type:   "https",
 				Raw:    serverTLS.URL,
@@ -717,11 +695,7 @@ func TestCheckHTTP(t *testing.T) {
 		},
 		{
 			"HTTPTargetNoScheme",
-			struct {
-				Target string
-				Type   string
-				Raw    string
-			}{
+			TestDependencyInfo{
 				Target: strings.TrimPrefix(serverOk.URL, "http://"),
 				Type:   "http",
 				Raw:    serverOk.URL,
@@ -733,11 +707,7 @@ func TestCheckHTTP(t *testing.T) {
 		},
 		{
 			"HTTPExplicitSchemeForce",
-			struct {
-				Target string
-				Type   string
-				Raw    string
-			}{
+			TestDependencyInfo{
 				Target: "https://" + strings.TrimPrefix(serverOk.URL, "http://"),
 				Type:   "http",
 				Raw:    serverOk.URL,
@@ -794,12 +764,11 @@ func TestCheckExec(t *testing.T) {
 	}{
 		{
 			"ExecOk",
-			struct {
-				Target string
-				Args   []string
-			}{
+			TestDependencyInfo{
 				Target: scriptOk,
 				Args:   []string{},
+				Type:   "exec",
+				Raw:    "exec://" + scriptOk,
 			},
 			2 * time.Second,
 			10 * time.Second,
@@ -807,12 +776,11 @@ func TestCheckExec(t *testing.T) {
 		},
 		{
 			"ExecFail",
-			struct {
-				Target string
-				Args   []string
-			}{
+			TestDependencyInfo{
 				Target: scriptFail,
 				Args:   []string{},
+				Type:   "exec",
+				Raw:    "exec://" + scriptFail,
 			},
 			2 * time.Second,
 			10 * time.Second,
@@ -820,12 +788,11 @@ func TestCheckExec(t *testing.T) {
 		},
 		{
 			"ExecWithArgs",
-			struct {
-				Target string
-				Args   []string
-			}{
+			TestDependencyInfo{
 				Target: scriptOk,
 				Args:   []string{"arg1", "arg2"},
+				Type:   "exec",
+				Raw:    "exec://" + scriptOk + " arg1 arg2",
 			},
 			2 * time.Second,
 			10 * time.Second,
@@ -833,25 +800,23 @@ func TestCheckExec(t *testing.T) {
 		},
 		{
 			"ExecTimeout",
-			struct {
-				Target string
-				Args   []string
-			}{
+			TestDependencyInfo{
 				Target: scriptTimeout,
 				Args:   []string{},
+				Type:   "exec",
+				Raw:    "exec://" + scriptTimeout,
 			},
-			3 * time.Second,
+			500 * time.Millisecond,
 			100 * time.Millisecond,
 			true,
 		},
 		{
 			"ExecNotFound",
-			struct {
-				Target string
-				Args   []string
-			}{
+			TestDependencyInfo{
 				Target: "/no/such/script/exists",
 				Args:   []string{},
+				Type:   "exec",
+				Raw:    "exec:///no/such/script/exists",
 			},
 			2 * time.Second,
 			10 * time.Second,
