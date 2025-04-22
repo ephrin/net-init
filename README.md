@@ -150,10 +150,24 @@ The following Prometheus metrics are exposed on the metrics endpoint (default: `
 * `netinit_dependency_up{dependency="<dependency_string>"}`: (Gauge) `1` if up, `0` if down.
 * `netinit_overall_status`: (Gauge) `1` if all dependencies ready, `0` otherwise.
 
+## Project Structure
+
+The project has been refactored into a modular structure for better maintainability and testability:
+
+* **pkg/application** - Application execution lifecycle management
+  * `runner.go` - Manages the execution of the specified command
+* **pkg/dependencies** - Dependency checking and management
+  * `dependency.go` - Dependency data structure and parsing
+  * `checker.go` - Dependency check operations and state management
+* **pkg/http** - HTTP server implementation
+  * `server.go` - Health check and metrics HTTP server
+* **pkg/config** - Configuration parsing and validation
+* **pkg/checks** - Individual dependency check implementations (TCP, UDP, HTTP, Exec)
+
 ## Development
 
 * **Prerequisites:** Go 1.22 or later
-* **Building:** `go build -o net-init main.go` or with optimized flags: `CGO_ENABLED=0 go build -ldflags="-w -s" -o net-init main.go`
+* **Building:** `go build` or with optimized flags: `CGO_ENABLED=0 go build -ldflags="-w -s" -o net-init`
 * **Testing:** 
   * Run all tests: `go test -v ./...`
   * Run a specific test: `go test -v -run=TestName`
