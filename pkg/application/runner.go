@@ -15,24 +15,26 @@ import (
 
 // Runner handles the application execution lifecycle
 type Runner struct {
-	cmd       []string
-	immediate bool
-	readyChan chan struct{}
-	sigChan   chan os.Signal
-	wg        *sync.WaitGroup
+	cmd            []string
+	immediate      bool
+	exitAfterReady bool
+	readyChan      chan struct{}
+	sigChan        chan os.Signal
+	wg             *sync.WaitGroup
 }
 
 // NewRunner creates a new application runner
-func NewRunner(cmd []string, startImmediately bool, readyChan chan struct{}, wg *sync.WaitGroup) *Runner {
+func NewRunner(cmd []string, startImmediately bool, exitAfterReady bool, readyChan chan struct{}, wg *sync.WaitGroup) *Runner {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	return &Runner{
-		cmd:       cmd,
-		immediate: startImmediately,
-		readyChan: readyChan,
-		sigChan:   sigChan,
-		wg:        wg,
+		cmd:            cmd,
+		immediate:      startImmediately,
+		exitAfterReady: exitAfterReady,
+		readyChan:      readyChan,
+		sigChan:        sigChan,
+		wg:             wg,
 	}
 }
 
@@ -75,24 +77,41 @@ func (r *Runner) Execute(ctx context.Context) (int, error) {
 
 // handleNoCommand manages the case where no command was specified
 func (r *Runner) handleNoCommand(ctx context.Context) (int, error) {
+	// If StartImmediately is set but no command is provided, this is an error condition
+	if r.immediate {
+		slog.Error("No command specified but StartImmediately is set. Nothing to execute.")
+		return 1, errors.New("no command provided with StartImmediately set")
+	}
+	
 	// Wait for dependencies to be ready or wait for signal
-	if !r.immediate && r.readyChan != nil {
+	if r.readyChan != nil {
 		slog.Info("No command specified. Waiting for dependencies to be ready...")
+		
 		select {
 		case <-r.readyChan:
-			slog.Info("Dependencies ready. Idling until terminated.")
+			slog.Info("Dependencies ready.")
+			
+			// If configured to exit after dependencies are ready, do so with success code
+			if r.exitAfterReady {
+				slog.Info("ExitAfterReady is set. Exiting with success code.")
+				return 0, nil
+			}
+			
+			slog.Info("Idling until terminated.")
+			
 		case <-ctx.Done():
 			slog.Error("Timeout reached while waiting for dependencies.", "error", ctx.Err())
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				return 124, context.DeadlineExceeded // 124 is standard for timeout
 			}
 			return 1, ctx.Err()
+			
 		case sig := <-r.sigChan:
 			slog.Info("Received signal while waiting for dependencies. Exiting.", "signal", sig)
 			return 0, nil
 		}
 	} else {
-		slog.Info("No command specified. Idling until terminated.")
+		slog.Info("No command specified and no dependencies. Idling until terminated.")
 	}
 
 	// Wait for termination signal

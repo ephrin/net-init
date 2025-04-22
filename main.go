@@ -49,8 +49,8 @@ func main() {
 	}
 	config.SetupLogging(cfg.LogLevel)
 
-	slog.Info("Net-Init starting", "config", fmt.Sprintf("Cmd=%v WaitDeps=%d StartImmediately=%t HealthPort=%d Timeout=%v Retry=%v LogLevel=%v",
-		cfg.Cmd, len(cfg.WaitDeps), cfg.StartImmediately, cfg.HealthCheckPort, cfg.Timeout, cfg.RetryInterval, cfg.LogLevel))
+	slog.Info("Net-Init starting", "config", fmt.Sprintf("Cmd=%v WaitDeps=%d StartImmediately=%t ExitAfterReady=%t HealthPort=%d Timeout=%v Retry=%v LogLevel=%v",
+		cfg.Cmd, len(cfg.WaitDeps), cfg.StartImmediately, cfg.ExitAfterReady, cfg.HealthCheckPort, cfg.Timeout, cfg.RetryInterval, cfg.LogLevel))
 
 	// 2. Setup Context and Shared Resources
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
@@ -107,6 +107,7 @@ func main() {
 	runner := application.NewRunner(
 		cfg.Cmd,
 		cfg.StartImmediately,
+		cfg.ExitAfterReady,
 		readyChan,
 		&wg,
 	)

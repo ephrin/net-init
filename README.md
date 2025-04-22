@@ -72,6 +72,7 @@ There are several ways to install and use `net-init` in your container images:
 | `NETINIT_TLS_SKIP_VERIFY`        | Set to `true` to skip TLS certificate verification for `https://` checks. **Use with caution!** | `false`        | `true`                                                      |
 | `NETINIT_TLS_CA_CERT_PATH`       | Path to a custom CA certificate file for `https://` checks.                                                                                                                            | *(none)* | `/etc/ssl/certs/my-ca.crt`                                  |
 | **`NETINIT_START_IMMEDIATELY`** | Set to `true` to start the main application (`CMD`) immediately, before dependencies are ready (only delays `/health` becoming 200). **Default is `false` (waits for dependencies).** | `false`        | `true`                                                      |
+| **`NETINIT_EXIT_AFTER_READY`** | Set to `true` to exit with success code (0) after dependencies are ready when no command is provided. If `false` (default), continues running until killed. This setting is ignored if a command is provided. | `false`        | `true`                                                      |
 
 **Dependency String Format (`NETINIT_WAIT`):**
 

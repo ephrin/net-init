@@ -22,6 +22,7 @@ type Config struct {
 	TlsSkipVerify    bool          // Skip TLS verification
 	TlsCACertPath    string        // Path to CA certificate for TLS
 	StartImmediately bool          // Start command without waiting for dependencies
+	ExitAfterReady   bool          // Exit with success code after dependencies are ready (when no command provided)
 }
 
 // Default values
@@ -95,6 +96,7 @@ func Parse(args []string) (*Config, error) {
 	// Parse booleans
 	cfg.TlsSkipVerify = parseBoolEnv("NETINIT_TLS_SKIP_VERIFY", false)
 	cfg.StartImmediately = parseBoolEnv("NETINIT_START_IMMEDIATELY", false)
+	cfg.ExitAfterReady = parseBoolEnv("NETINIT_EXIT_AFTER_READY", false)
 
 	// Parse other strings
 	cfg.TlsCACertPath = os.Getenv("NETINIT_TLS_CA_CERT_PATH")
