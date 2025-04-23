@@ -136,8 +136,8 @@ When running in Docker environments, network requests to non-existent services c
 For TCP dependencies, `net-init` performs multi-phase validation:
 1. **DNS Resolution**: First explicitly checks if the hostname can be resolved, preventing false positives from Docker DNS handling.
 2. **Connection Establishment**: Verifies that a real TCP connection can be established.
-3. **Protocol-Specific Probing**: Sends appropriate probes based on the port (e.g., HTTP HEAD for ports 80/443).
-4. **Response Validation**: Carefully examines responses to detect service placeholders and misleading responses.
+3. **Reachability-Based Validation**: For most services (database servers, message brokers, etc.), successful connection establishment is considered sufficient proof of reachability.
+4. **Protocol-Specific Validation**: For HTTP ports (80/443), continues with additional protocol-specific probing and response validation to ensure the service is responding properly.
 
 ### HTTP Redirect Handling
 

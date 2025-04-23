@@ -116,8 +116,18 @@ func CheckTCP(ctx context.Context, dep interface{}, _ *http.Client) error {
 		return fmt.Errorf("connection write failed: %w", err)
 	}
 
-	// Now try to read a response - we don't require a valid response,
-	// but at least some data or a graceful close
+	// Use a flag to determine if we should do a full protocol check or just verify reachability
+	// For HTTP ports (80/443) we want to do a full protocol check
+	doFullProtocolCheck := portNum == 80 || portNum == 443
+
+	// If we're only checking reachability and not protocol compliance,
+	// successful connection establishment is sufficient
+	if !doFullProtocolCheck {
+		slog.Debug("TCP connection established, considering target reachable", "target", target)
+		return nil
+	}
+
+	// For HTTP ports, continue with protocol-specific validation
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 
 	// Try to read a response
@@ -130,8 +140,7 @@ func CheckTCP(ctx context.Context, dep interface{}, _ *http.Client) error {
 			// This is acceptable behavior
 			slog.Debug("Connection closed by server after probe (EOF)", "target", target)
 		} else if os.IsTimeout(err) {
-			// In Docker environment, we need to be super strict about timeouts
-			// if we already confirmed DNS resolution
+			// For HTTP ports, timeout is considered a failure
 			slog.Debug("Connection read timed out - marking as failure", "target", target)
 			return fmt.Errorf("connection read timed out: %w", err)
 		} else {
