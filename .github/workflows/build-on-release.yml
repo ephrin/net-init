@@ -1,0 +1,72 @@
+name: Build Docker Image on Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Extract metadata
+        id: meta
+        run: |
+          # Extract version from GitHub ref (e.g., refs/tags/v1.2.3 -> v1.2.3)
+          VERSION=${GITHUB_REF#refs/tags/}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+      
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Login to DockerHub (if needed)
+        if: false  # Change to true if you want to push to DockerHub as well
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      
+      - name: Build and push multi-platform image
+        run: |
+          # Use the provided build.sh script
+          chmod +x ./build.sh
+          
+          # Build and push version-tagged image
+          ./build.sh --tag ghcr.io/${{ github.repository_owner }}/net-init:${{ steps.meta.outputs.version }} \
+                     --platforms linux/amd64,linux/arm64 \
+                     --dockerfile ./dist.dockerfile \
+                     --push
+          
+          # Build and push latest-tagged image
+          ./build.sh --tag ghcr.io/${{ github.repository_owner }}/net-init:latest \
+                     --platforms linux/amd64,linux/arm64 \
+                     --dockerfile ./dist.dockerfile \
+                     --push
+      
+      - name: Check image
+        run: |
+          echo "Verifying image existence..."
+          docker buildx imagetools inspect ghcr.io/${{ github.repository_owner }}/net-init:${{ steps.meta.outputs.version }}
+      
+      - name: Update documentation with new version (optional)
+        if: false  # Disabled by default, enable if needed
+        run: |
+          echo "Updating documentation reference with version ${{ steps.meta.outputs.version }}..."
+          # Add your documentation update commands here

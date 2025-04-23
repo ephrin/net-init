@@ -175,6 +175,24 @@ The project has been refactored into a modular structure for better maintainabil
 * **Integration Testing:** `cd integration-test && ./run-test.sh`
 * **Dependencies:** Uses Go modules. Run `go mod tidy`
 
+## CI/CD
+
+The project uses GitHub Actions for continuous integration and delivery:
+
+* **Automated Releases:** A new version is automatically created when code is pushed to the main branch
+  * Version numbers follow Semantic Versioning principles
+  * Version is incremented based on commit message keywords:
+    * Major version bump: Messages containing "BREAKING CHANGE" or "major"
+    * Minor version bump: Messages containing "feat", "!:", or "FEATURE"
+    * Patch version bump: All other changes
+  * Release notes are generated from commit messages
+  
+* **Automated Builds:** Docker images are automatically built when a new release is published
+  * Multi-platform images for both amd64 and arm64 architectures
+  * Images are pushed to GitHub Container Registry (ghcr.io)
+  * Available as both version-specific tags and `latest` tag
+  * Example: `docker pull ghcr.io/ephrin/net-init:v1.2.3`
+
 ## Contributing
 
 Contributions are welcome! Please feel free to open an issue or submit a pull request.
