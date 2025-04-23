@@ -21,11 +21,11 @@ jobs:
           # Extract version from GitHub ref (e.g., refs/tags/v1.2.3 -> v1.2.3)
           VERSION=${GITHUB_REF#refs/tags/}
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Version: $VERSION"
+          echo "Version extracted: $VERSION"
       
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
-      
+        
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         
@@ -42,23 +42,18 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      
+        
       - name: Build and push multi-platform image
-        run: |
-          # Use the provided build.sh script
-          chmod +x ./build.sh
-          
-          # Build and push version-tagged image
-          ./build.sh --tag ghcr.io/${{ github.repository_owner }}/net-init:${{ steps.meta.outputs.version }} \
-                     --platforms linux/amd64,linux/arm64 \
-                     --dockerfile ./dist.dockerfile \
-                     --push
-          
-          # Build and push latest-tagged image
-          ./build.sh --tag ghcr.io/${{ github.repository_owner }}/net-init:latest \
-                     --platforms linux/amd64,linux/arm64 \
-                     --dockerfile ./dist.dockerfile \
-                     --push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./dist.dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/net-init:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/net-init:latest
+          provenance: false
       
       - name: Check image
         run: |
