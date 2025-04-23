@@ -166,15 +166,14 @@ func (c *Checker) monitorDependency(ctx context.Context, dep *Dependency, ticker
 // waitForCancellation waits for context cancellation for initially ready dependencies
 func (c *Checker) waitForCancellation(ctx context.Context, dep *Dependency) {
 	<-ctx.Done()
-	c.handleCancellation(dep, ctx.Err())
+	// Just log cancellation but don't change state - let application handle reconnection failures
+	slog.Debug("Check stopping due to context cancellation", "dependency", dep.Raw, "reason", ctx.Err())
 }
 
 // handleCancellation handles cleanup when context is cancelled
 func (c *Checker) handleCancellation(dep *Dependency, reason error) {
-	slog.Warn("Stopping check due to context cancellation", "dependency", dep.Raw, "reason", reason)
-	if dep.IsReady.Load() {
-		dep.IsReady.Store(false)
-		dep.Metric.Set(0)
-		c.checkOverallReady()
-	}
+	// Just log cancellation but don't change dependency state
+	slog.Debug("Check stopping due to context cancellation", "dependency", dep.Raw, "reason", reason)
+	// No longer marking as not ready on cancellation:
+	// Once dependencies are ready and application starts, let the application handle reconnection failures
 }
