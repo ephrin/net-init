@@ -62,13 +62,12 @@ jobs:
         run: |
           LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || git rev-list --max-parents=0 HEAD)
           
-          # Write release notes to a file instead of manipulating the string
-          git log --pretty=format:"* %s (%h)" $LATEST_TAG..HEAD > release_notes.txt
-          
-          # Use GitHub's multiline output syntax
-          echo "notes<<EOF" >> "$GITHUB_OUTPUT"
-          cat release_notes.txt >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          # Generate release notes as a multiline string with proper delimiter
+          {
+            echo 'notes<<EOFRELEASENOTES'
+            git log --pretty=format:"* %s (%h)" $LATEST_TAG..HEAD
+            echo 'EOFRELEASENOTES'
+          } >> "$GITHUB_OUTPUT"
       
       - name: Create Release
         id: create_release
