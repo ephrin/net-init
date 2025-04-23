@@ -105,6 +105,7 @@ func (c *Checker) performCheck(ctx context.Context, dep *Dependency) error {
 // handleStateChange updates dependency state and metrics
 func (c *Checker) handleStateChange(dep *Dependency, isReady bool, err error) bool {
 	stateChanged := false
+	applicationStarted := c.allReady.Load()
 
 	if isReady { // Dependency is ready
 		if !dep.IsReady.Load() {
@@ -115,10 +116,19 @@ func (c *Checker) handleStateChange(dep *Dependency, isReady bool, err error) bo
 		}
 	} else { // Dependency is not ready
 		if dep.IsReady.Load() {
-			slog.Warn("Dependency NOT ready (was ready before)", "dependency", dep.Raw, "error", err)
-			dep.IsReady.Store(false)
-			dep.Metric.Set(0)
-			stateChanged = true
+			// If the application has already started (all dependencies were ready before),
+			// just log the issue but don't change the state
+			if applicationStarted {
+				slog.Warn("Dependency connection check failed (ignoring since application has started)",
+					"dependency", dep.Raw, "error", err)
+				// Don't change state or metric, application is already running
+			} else {
+				// During initial startup, mark dependency as not ready
+				slog.Warn("Dependency NOT ready (was ready before)", "dependency", dep.Raw, "error", err)
+				dep.IsReady.Store(false)
+				dep.Metric.Set(0)
+				stateChanged = true
+			}
 		} else {
 			slog.Debug("Dependency not ready", "dependency", dep.Raw, "error", err)
 		}

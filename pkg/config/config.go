@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -203,7 +204,134 @@ func parseBoolEnv(key string, defaultVal bool) bool {
 
 // SetupLogging configures the global logger based on environment variables.
 func SetupLogging(level slog.Level) {
-	jsonHandler := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level})
-	logger := slog.New(jsonHandler)
+	// Get the version hash
+	var versionHash string = "62fcd5a" // Default hardcoded version
+
+	// Use stdout for info and below, stderr for warn and above
+	infoAndBelow := &slog.LevelVar{}
+	infoAndBelow.Set(slog.LevelInfo)
+
+	// Create split handler - info/debug to stdout, warnings/errors to stderr
+	var jsonHandler slog.Handler
+
+	if level.Level() <= slog.LevelInfo.Level() {
+		// For info and debug, split between stdout and stderr
+		stdoutHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+			Level: infoAndBelow,
+			ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+				// Add source and version to all logs
+				if a.Key == slog.TimeKey && len(groups) == 0 {
+					return a
+				}
+				return a
+			},
+		})
+
+		stderrHandler := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+			Level: slog.LevelWarn,
+			ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+				// Add source and version to all logs
+				if a.Key == slog.TimeKey && len(groups) == 0 {
+					return a
+				}
+				return a
+			},
+		})
+
+		// Use custom handler to split logs between stdout and stderr
+		jsonHandler = &splitHandler{
+			stderrHandler: stderrHandler,
+			stdoutHandler: stdoutHandler,
+		}
+	} else {
+		// For warn and error only, send everything to stderr
+		jsonHandler = slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+			Level: level,
+			ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+				// Add source and version to all logs
+				if a.Key == slog.TimeKey && len(groups) == 0 {
+					return a
+				}
+				return a
+			},
+		})
+	}
+
+	// Create a wrapper handler that adds source and version attributes
+	attrHandler := &attributeHandler{
+		handler: jsonHandler,
+		attrs: []slog.Attr{
+			slog.String("source", "net-init"),
+			slog.String("version", versionHash),
+		},
+	}
+
+	// Set default logger
+	logger := slog.New(attrHandler)
 	slog.SetDefault(logger)
+}
+
+// splitHandler is a custom slog.Handler that routes logs to different outputs based on level
+type splitHandler struct {
+	stdoutHandler slog.Handler // For info and below
+	stderrHandler slog.Handler // For warn and above
+}
+
+func (h *splitHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	// Enable if either handler would accept it
+	return h.stdoutHandler.Enabled(ctx, level) || h.stderrHandler.Enabled(ctx, level)
+}
+
+func (h *splitHandler) Handle(ctx context.Context, r slog.Record) error {
+	// Route to appropriate handler based on level
+	if r.Level >= slog.LevelWarn {
+		return h.stderrHandler.Handle(ctx, r)
+	}
+	return h.stdoutHandler.Handle(ctx, r)
+}
+
+func (h *splitHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &splitHandler{
+		stdoutHandler: h.stdoutHandler.WithAttrs(attrs),
+		stderrHandler: h.stderrHandler.WithAttrs(attrs),
+	}
+}
+
+func (h *splitHandler) WithGroup(name string) slog.Handler {
+	return &splitHandler{
+		stdoutHandler: h.stdoutHandler.WithGroup(name),
+		stderrHandler: h.stderrHandler.WithGroup(name),
+	}
+}
+
+// attributeHandler is a custom slog.Handler that adds fixed attributes to all records
+type attributeHandler struct {
+	handler slog.Handler
+	attrs   []slog.Attr
+}
+
+func (h *attributeHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.handler.Enabled(ctx, level)
+}
+
+func (h *attributeHandler) Handle(ctx context.Context, r slog.Record) error {
+	// Add all the fixed attributes to the record
+	for _, attr := range h.attrs {
+		r.AddAttrs(attr)
+	}
+	return h.handler.Handle(ctx, r)
+}
+
+func (h *attributeHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &attributeHandler{
+		handler: h.handler.WithAttrs(attrs),
+		attrs:   h.attrs,
+	}
+}
+
+func (h *attributeHandler) WithGroup(name string) slog.Handler {
+	return &attributeHandler{
+		handler: h.handler.WithGroup(name),
+		attrs:   h.attrs,
+	}
 }
