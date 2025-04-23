@@ -205,7 +205,7 @@ func parseBoolEnv(key string, defaultVal bool) bool {
 // SetupLogging configures the global logger based on environment variables.
 func SetupLogging(level slog.Level) {
 	// Get the version hash
-	var versionHash string = "62fcd5a" // Default hardcoded version
+	var versionHash string = "99b60e5" // Default hardcoded version
 
 	// Use stdout for info and below, stderr for warn and above
 	infoAndBelow := &slog.LevelVar{}
