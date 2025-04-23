@@ -54,29 +54,28 @@ jobs:
           fi
           
           NEW_VERSION="v$MAJOR.$MINOR.$PATCH"
-          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
           echo "Version determined as: $NEW_VERSION (previous was: $LATEST_TAG)"
       
       - name: Generate release notes
         id: release_notes
         run: |
           LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || git rev-list --max-parents=0 HEAD)
-          NOTES=$(git log --pretty=format:"* %s (%h)" $LATEST_TAG..HEAD)
           
-          # Escape newlines for GitHub output
-          NOTES="${NOTES//'%'/'%25'}"
-          NOTES="${NOTES//$'\n'/'%0A'}"
-          NOTES="${NOTES//$'\r'/'%0D'}"
+          # Write release notes to a file instead of manipulating the string
+          git log --pretty=format:"* %s (%h)" $LATEST_TAG..HEAD > release_notes.txt
           
-          echo "notes=$NOTES" >> $GITHUB_OUTPUT
+          # Use GitHub's multiline output syntax
+          echo "notes<<EOF" >> "$GITHUB_OUTPUT"
+          cat release_notes.txt >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
       
       - name: Create Release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        id: create_release
+        uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.semver.outputs.new_version }}
-          release_name: Release ${{ steps.semver.outputs.new_version }}
+          name: Release ${{ steps.semver.outputs.new_version }}
           body: |
             ## Changes in this Release
             
@@ -93,3 +92,4 @@ jobs:
             ```
           draft: false
           prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}
