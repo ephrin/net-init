@@ -61,13 +61,23 @@ jobs:
         id: release_notes
         run: |
           LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || git rev-list --max-parents=0 HEAD)
+          NOTES=$(git log --pretty=format:"* %s (%h)" $LATEST_TAG..HEAD)
           
-          # Generate release notes as a multiline string with proper delimiter
           {
-            echo 'notes<<EOFRELEASENOTES'
-            git log --pretty=format:"* %s (%h)" $LATEST_TAG..HEAD
-            echo 'EOFRELEASENOTES'
-          } >> "$GITHUB_OUTPUT"
+            echo "## Changes in this Release"
+            echo ""
+            echo "$NOTES"
+            echo ""
+            echo "## Installation"
+            echo ""
+            echo '```bash'
+            echo "# Use with Docker"
+            echo "docker pull ghcr.io/ephrin/net-init:\${GITHUB_REF#refs/tags/}"
+            echo ""
+            echo "# Or build from source"
+            echo "go install github.com/ephrin/net-init@\${GITHUB_REF#refs/tags/}"
+            echo '```'
+          } > release_notes.txt
       
       - name: Create Release
         id: create_release
@@ -75,20 +85,7 @@ jobs:
         with:
           tag_name: ${{ steps.semver.outputs.new_version }}
           name: Release ${{ steps.semver.outputs.new_version }}
-          body: |
-            ## Changes in this Release
-            
-            ${{ steps.release_notes.outputs.notes }}
-            
-            ## Installation
-            
-            ```bash
-            # Use with Docker
-            docker pull ghcr.io/ephrin/net-init:${{ steps.semver.outputs.new_version }}
-            
-            # Or build from source
-            go install github.com/ephrin/net-init@${{ steps.semver.outputs.new_version }}
-            ```
+          body_path: release_notes.txt
           draft: false
           prerelease: false
           token: ${{ secrets.GITHUB_TOKEN }}
