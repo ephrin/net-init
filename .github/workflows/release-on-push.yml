@@ -89,3 +89,5 @@ jobs:
           draft: false
           prerelease: false
           token: ${{ secrets.GITHUB_TOKEN }}
+          # Ensure this release is published right away to trigger the build workflow
+          generate_release_notes: false
